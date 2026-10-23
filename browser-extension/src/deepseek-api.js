@@ -27,57 +27,69 @@
   }
 
   function createState() {
-    return { buffer: '', text: '', done: false };
+    return { buffer: '', text: '', done: false, fragments: [], currentPath: '', currentOperation: 'APPEND' };
   }
 
-  function handleDeepSeekData(data, state) {
-    if (!data || typeof data !== 'object') {
-      return;
-    }
+  function updateAnswer(state) {
+    state.text = state.fragments.filter((fragment) => ['RESPONSE', 'ANSWER', 'FINAL', 'TEXT'].includes(String(fragment?.type).toUpperCase()))
+      .map((fragment) => typeof fragment.content === 'string' ? fragment.content : '').join('');
+  }
+
+  function handleDeepSeekData(data, state, basePath = '') {
+    if (!data || typeof data !== 'object') return;
     const value = data.v;
-
-    if (value && typeof value === 'object' && value.response) {
-      const fragments = value.response?.fragments;
-      if (Array.isArray(fragments)) {
-        const content = fragments
-          .filter(
-            (fragment) =>
-              fragment &&
-              typeof fragment.content === 'string' &&
-              fragment.type !== 'THINKING',
-          )
-          .map((fragment) => fragment.content)
-          .join('');
-        if (content) {
-          if (!state.text || (content.length > state.text.length && content.startsWith(state.text))) {
-            state.text = content;
-          }
-        }
-      }
-      return;
-    }
-
+    const explicit = typeof data.p === 'string' ? data.p.replace(/^\//, '') : null;
+    const patchPath = explicit === null ? state.currentPath
+      : basePath && !explicit.startsWith('response/') && explicit !== 'response' ? `${basePath}/${explicit}` : explicit;
     if (data.o === 'BATCH' && Array.isArray(value)) {
-      if (
-        value.some((patch) => patch?.p === 'quasi_status' && patch?.v === 'FINISHED')
-      ) {
-        state.done = true;
-      }
+      for (const patch of value) handleDeepSeekData(patch, state, explicit === null ? basePath : patchPath);
       return;
     }
-
-    if (data.p === 'response/status' && data.o === 'SET') {
-      if (value === 'FINISHED') {
-        state.done = true;
+    if (explicit !== null) state.currentPath = patchPath;
+    const operation = String(data.o || state.currentOperation || 'APPEND').toUpperCase();
+    if (data.o) state.currentOperation = operation;
+    const response = value?.response || (patchPath === 'response' ? value : null);
+    if (response && typeof response === 'object') {
+      const fragments = response.fragments;
+      if (Array.isArray(fragments)) {
+        state.fragments = fragments.map((fragment) => ({ ...fragment }));
+        state.currentPath = `response/fragments/${fragments.length - 1}/content`;
+        state.currentOperation = 'APPEND';
+        updateAnswer(state);
       }
+      if (response.status === 'FINISHED') state.done = true;
       return;
     }
-
-    if (typeof value === 'string') {
-      if (data.o === 'APPEND' || (!data.p && !data.o)) {
-        state.text += value;
+    if (['response/status', 'response/quasi_status', 'quasi_status'].includes(patchPath)) {
+      if (value === 'FINISHED') state.done = true;
+      return;
+    }
+    if (patchPath === 'response/fragments' && Array.isArray(value)) {
+      const fragments = value.map((fragment) => ({ ...fragment }));
+      state.fragments = operation === 'APPEND' ? [...state.fragments, ...fragments] : fragments;
+      state.currentPath = `response/fragments/${state.fragments.length - 1}/content`;
+      state.currentOperation = 'APPEND';
+      updateAnswer(state);
+      return;
+    }
+    const match = /^response\/fragments\/(-?\d+)(?:\/(content|type))?$/.exec(patchPath);
+    if (!match) return; // Ignore metadata/unknown fields, never append them to an answer.
+    const index = Number(match[1]) < 0 ? state.fragments.length + Number(match[1]) : Number(match[1]);
+    if (index < 0 || index > 1000) return;
+    if (!match[2] && value && typeof value === 'object' && !Array.isArray(value)) {
+      state.fragments[index] = { ...value };
+      state.currentPath = `response/fragments/${index}/content`;
+      state.currentOperation = 'APPEND';
+    } else if (state.fragments[index] && typeof value === 'string') {
+      const fragment = state.fragments[index];
+      if (match[2] === 'type') {
+        if (fragment.type !== value) fragment.content = '';
+        fragment.type = value;
+      } else if (match[2] === 'content') {
+        fragment.content = operation === 'APPEND' ? String(fragment.content || '') + value : value;
       }
     }
+    updateAnswer(state);
   }
 
   function handleSseBlock(block, state) {
@@ -112,7 +124,7 @@
   }
 
   function feedSseText(chunk, state) {
-    state.buffer += chunk;
+    state.buffer = (state.buffer + chunk).replace(/\r\n/g, '\n');
     let separator;
     while ((separator = state.buffer.indexOf('\n\n')) !== -1) {
       const block = state.buffer.slice(0, separator);
@@ -160,15 +172,7 @@
       post({ type: 'capture-done', captureId, text: state.text });
     } catch (error) {
       flushSseBuffer(state);
-      if (state.text) {
-        post({ type: 'capture-done', captureId, text: state.text });
-      } else {
-        post({
-          type: 'capture-error',
-          captureId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+      post({ type: 'capture-error', captureId, error: error instanceof Error ? error.message : String(error) });
     }
   }
 

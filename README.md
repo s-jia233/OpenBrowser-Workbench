@@ -1,565 +1,176 @@
-<h1 style="display: flex; align-items: bottom;">
-  <img
-    src="./src/assest/favicon.png"
-    width="32"
-    style="margin-right: 8px;"
-  />
-  <span>
-    <span style="color: #FFDAB9;">Open</span><span style="color: #FF8C00;">Browser</span>
-  </span>
-</h1>
+# OpenBrowser Workbench
 
-<p align="center">
-  <img src="./src/assest/logo.png" alt="OpenBrowser" width="420" />
-</p>
+**把网页 AI 接入本地项目：看懂代码、比较方案、审核修改、验证结果。**
 
-<p align="center">
-  <a href="https://github.com/1129Aliasgar/OpenBrowser/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <a href="https://github.com/1129Aliasgar/OpenBrowser"><img src="https://img.shields.io/github/stars/1129Aliasgar/OpenBrowser?style=social" alt="GitHub stars" /></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D20-brightgreen" alt="Node.js 20+" />
-  <img src="https://img.shields.io/badge/pnpm-11.x-orange" alt="pnpm 11" />
-</p>
+OpenBrowser Workbench 主要用来做两件事：**让你正在使用的网页 AI 帮你维护本地代码，以及让多个 AI 对同一个开发任务提出方案，供你比较和选择。**
 
-**Turn free browser AI chat into a local coding agent — no API key, no extra AI subscription.**
+你在本地工作台选择项目、描述目标，模型结合项目代码回答或提出修改；工作台把修改显示成 Diff，由你批准后写入文件并运行所选验证。不必在聊天网页、文件管理器和编辑器之间反复复制源码、手动覆盖文件。
 
-OpenBrowser is a **free AI tool** and **local AI agent harness** that connects ChatGPT, Gemini, DeepSeek, Claude, Perplexity, GLM, Grok, and other browser-based AI assistants to your project workspace. Run commands in the terminal — prompts are **auto-sent to your AI tab** via the browser extension, responses flow back to the terminal automatically. No manual copy-paste. **No API keys required** — use your existing **browser AI subscription** (including free plans).
+它不是一个新的大模型，而是连接 **AI 对话、项目文件和本地开发流程** 的工作台。适合个人开发者、课程项目和开源维护者，用于辅助开发和人工决策，不是无人值守的自动开发系统。
 
-> **Star the repo** on [GitHub](https://github.com/1129Aliasgar/OpenBrowser) to support the project and help others discover it.
+本项目由 **Jia** 维护，基于 [1129Aliasgar/OpenBrowser](https://github.com/1129Aliasgar/OpenBrowser) 二次开发，沿用 MIT 许可。
 
----
+## 主要用来做什么？
 
-## What is OpenBrowser?
+| 你的任务 | 可以怎样使用 |
+| --- | --- |
+| 看懂一个项目或接手别人的代码 | 选择相关文件，在“项目问答”中解释模块职责、分析逻辑、讨论报错，再在原对话继续追问。 |
+| 修 Bug、补测试、改文档或做小范围功能迭代 | 在“修改代码”中描述目标，让模型查找并读取相关源码、提出补丁；查看 Diff 后决定是否应用和验证。 |
+| 给一个新功能选方案 | 在“多模型协作”中让多个参与者基于同一份代码快照独立提案，再由指定评审比较优缺点，按你的意见生成统一草案。 |
 
-OpenBrowser is an open-source **AI agent** for developers who want **ChatGPT for free coding**, **Claude for free coding**, or any browser AI plan — without paying for a separate API key or AI subscription. It acts as a **CLI harness** between your terminal and the AI chat tab you already use in Chrome.
+### 例子：修复一个登录问题
 
-- **Free AI tool** — works with free browser tiers (ChatGPT, Claude, Gemini, and more)
-- **No API key** — your browser session is the connection; no OpenAI or Anthropic API billing
-- **AI coding agent** — ask questions, edit files with diff preview, attach `@file` / `@folder` context
-- **Local-first** — bridge runs on `127.0.0.1`; you approve every file change
+在“修改代码”中输入：
 
----
+> 登录接口返回 401 时，页面没有错误提示。请查找登录相关代码，保留现有接口，修复提示逻辑并补充测试。
 
-## FAQ
+模型可以先请求搜索和读取相关文件，再提出修改。你审核涉及哪些文件、具体改了哪些行，批准后由本地程序应用补丁并运行所选验证。若验证失败，会尝试回滚本轮文件修改，并在次数限制内把错误反馈给模型；新的修改仍由你审核。
 
-### Can ChatGPT be used for coding?
+如果需求还没想清楚，也可以先用“多模型协作”：
 
-Yes. ChatGPT is widely used for coding help, but the browser UI is not built for editing a whole project. OpenBrowser lets you use **ChatGPT for coding** from the terminal: send prompts from your repo, get answers in the terminal, and in **agent** mode apply multi-file changes with diff preview — still using your **ChatGPT browser subscription**, not an API key.
+> 为这个项目增加登录过期处理。分别提出最小改动方案和统一拦截方案，比较兼容性、改动范围和测试成本。
 
-### How to use ChatGPT for free coding?
+你可以采纳其中一份，也可以选取多份方案的部分思路，补充意见后生成统一草案，再进入代码修改流程。
 
-1. Open [ChatGPT](https://chatgpt.com) in Chrome (free or Plus plan).
-2. Install the OpenBrowser Chrome extension and run `openbrowser` in your project folder.
-3. Run `openbrowser ask "..."` for Q&A or `openbrowser agent "..."` for file edits.
+## 这个项目的特点
 
-You get a **free AI coding workflow** as long as your browser plan allows chat — no separate API subscription.
+### 1. 复用已有的 AI 网页
 
-### How to use Claude for free coding?
+通过浏览器扩展连接支持的 ChatGPT、DeepSeek、Gemini 等聊天网页，让网页 AI 参与本地项目开发。浏览器模式不需要另外配置模型 API 密钥；也可以手动传递提示词和回复。是否允许自动化、可用模型及额度，取决于服务商规则和你的账号。
 
-Same flow with [Claude](https://claude.ai): keep a Claude tab open, load the extension, run `openbrowser ask` or `openbrowser agent` from your project. OpenBrowser auto-sends prompts and returns responses to the terminal so you can use **Claude for free coding** (or on your existing Claude subscription) without an Anthropic API key.
+### 2. 多个 AI 提方案，人来定方向
 
-### Do I need an API key or paid AI subscription?
+不只是在不同聊天窗口里分别提问：工作台给参与者分发相同任务和代码快照，保留各份回复，组织评审、人工反馈和方案融合。你能对照需求覆盖、优势、风险、源码依据和验证建议，再决定下一步。
 
-No API key is required. OpenBrowser does not call OpenAI, Anthropic, or Google APIs directly — it bridges your **existing browser AI subscription**. If you already use ChatGPT, Claude, or Gemini in the browser (including free tiers), you can use them as your **AI agent** for local development.
+提案、评审和融合可混用指定网页、手动传递及本机 Ollama。它们比较的是方案，不会自动执行所有候选代码，也不会把评审意见当成测试成绩。
 
-### Is OpenBrowser a free alternative to API-based coding agents?
+### 3. 模型可以找代码，不必每次手工挑文件
 
-OpenBrowser is a **free, open-source AI tool** for developers who prefer browser AI over API billing. It is not a replacement for every feature of paid IDE agents, but it delivers ask mode, agent mode with diffs, and project context — powered by the **AI subscription you already have** in the browser.
+修改代码模式提供列目录、关键词搜索和按行读取工具。模型可以先定位问题，再读取相关源码，减少你逐个查找、粘贴文件的工作。也支持直接勾选文件，让任务从明确的范围开始。
 
-### What is an AI harness?
+### 4. 修改先看清，再落到文件
 
-In this project, an **AI harness** is the local bridge (CLI + extension) that wires browser chat to your workspace: queue prompts, inject them into the AI composer, capture replies, and apply file operations safely on your machine.
+模型回复不是直接执行的命令。工作台将结构化文件操作转成按文件展示的 Diff，检查路径、已读范围和文件变化，等你批准整轮方案后才写入。可选择运行项目已有的 typecheck、test、lint、build 脚本，并查看实际验证和回滚结果。
 
----
+### 5. 一次任务可以持续讨论
 
-## Features
+问题、方案、补充要求和后续修改保留在同一对话中。每轮重新读取相关上下文；需求不清楚时，直接回答模型的问题，不必反复开新任务。会话、执行记录和诊断保存在本机，并支持标题搜索、重命名、置顶、归档与删除。未发送的任务、追问和手动回复文本自动保存在当前浏览器，刷新后可恢复，不会自动提交。
 
-| Mode       | What it does                                                                                |
-| ---------- | ------------------------------------------------------------------------------------------- |
-| **Ask**    | Auto-send prompt with system instructions; Markdown response appears in the terminal        |
-| **Agent**  | Auto-send task + project context + JSON schema instructions; preview diffs, apply or reject |
-| **Server** | Run the bridge API on `http://127.0.0.1:5000` for the browser extension                     |
+## 当前版本
 
-- Local bridge server (Fastify) on port **5000**
-- Interactive wake mode — run `openbrowser` with no args for an ask/agent menu
-- `@file` / `@folder` context attachments with Tab completion
-- Large prompts auto-delivered as `openbrowser-prompt.txt` when they exceed the UI paste limit
-- Zod-validated AI operation schema (`CREATE_FILE`, `EDIT_FILE`, etc.)
-- Unified diff preview before any file is touched
-- Edit history stored in `.openbrowser/history.json`
-- Chrome extension for supported AI sites
+**开发预览版**：工作台 `0.6.6`，浏览器扩展 `0.8.14`。这些是组件版本，不代表已经发布 GitHub Release。浏览器适配仍在完善；建议先在可备份的小项目上使用，具体边界见下方“安全与已知限制”。
 
----
+## 快速开始
 
-## Requirements
+准备 Node.js 和 pnpm。项目声明的 Node.js 要求为 `>=20`，包管理器为 `pnpm@11.0.0`；安装时还需满足该 pnpm 版本自身的运行要求，配置见 [package.json](./package.json)。
 
-- **Node.js** 20 or later
-- **pnpm** 11.x ([install guide](#install-pnpm))
-- **Google Chrome** (or any Chromium browser) for the extension
+克隆本仓库（或下载源码 ZIP 后解压），进入包含 `package.json` 的目录：
 
----
-
-## Quick Start
-
-```bash
-# 1. Clone and install
-git clone https://github.com/1129Aliasgar/OpenBrowser.git
-cd OpenBrowser
+```powershell
+git clone https://github.com/s-jia233/OpenBrowser-Workbench.git
+cd OpenBrowser-Workbench
 pnpm install
-
-# 2. Build the CLI
 pnpm build
-
-# 3. Enable the openbrowser command in your terminal
-pnpm setup
-pnpm link --global
-
-# 4. Copy environment config
-cp .env.example .env        # Windows: copy .env.example .env
-
-# 5. Load the Chrome extension (see Browser Extension section)
-
-# 6. Open https://chatgpt.com in Chrome and reload the tab
-
-# 7. Open a new PowerShell window, then run
-openbrowser ask "How do I add JWT auth in Express?"
+pnpm web
 ```
 
-> **Before running:** An AI chat tab must be open in Chrome with the extension loaded. The extension listens over SSE and auto-injects prompts.
+打开 [http://127.0.0.1:5000](http://127.0.0.1:5000/)。保留启动终端，按 Ctrl+C 停止服务。
 
-> **Getting `openbrowser is not recognized`?**  
-> Run `pnpm setup`, then `pnpm build` and `pnpm link --global`, and open a **new** terminal. Or use `pnpm start ask "..."` without global install — see [CLI Usage](#cli-usage).
+Windows 安装时若遇到链接权限问题，可尝试 `pnpm install --node-linker=hoisted`，然后重新构建。首次安装、升级或更改后端源码后需要构建；只改前端静态文件时刷新网页即可。
 
----
+### 连接浏览器 AI
 
-## Install pnpm
+1. 在 Edge 打开 `edge://extensions`，或在 Chrome 打开 `chrome://extensions`。
+2. 开启开发者模式，选择“加载解压缩的扩展”，选中本仓库的 `browser-extension` 文件夹。
+3. 登录受支持的 AI 网页并刷新，再回到工作台选择“浏览器扩展”。只有一个就绪页面时可自动选择；多个页面就绪时，在“执行网页”中指定本轮 AI。选中的页面离线后不会自动改发给其他页面。
+4. 更新扩展源码后，重新加载扩展并刷新 AI 网页；只刷新工作台不能更新扩展脚本。
 
-```bash
-corepack enable
-corepack prepare pnpm@11.0.0 --activate
-```
+扩展要求 Chromium 120 或以上，默认连接 `http://127.0.0.1:5000`。包含 ChatGPT、DeepSeek、Gemini 等站点适配，但不保证所有网站和账号状态都可用；网页登录、额度和服务规则仍然适用。
 
-Verify:
+### 不装扩展：手动传递
 
-```bash
-node -v    # v20+
-pnpm -v    # 11.x
-```
+选择“手动传递”，开始任务后复制提示词给模型，再把完整回复粘贴回工作台。项目问答接受文本；修改代码需要符合提示词要求的结构化 JSON。接收后仍按正常流程审核 Diff。
 
----
-
-## Installation
-
-### 1. Install dependencies
-
-```bash
-pnpm install
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env        # Windows: copy .env.example .env
-```
-
-| Variable                      | Default      | Description                                                    |
-| ----------------------------- | ------------ | -------------------------------------------------------------- |
-| `PORT`                        | `5000`       | Bridge server port                                             |
-| `BRIDGE_TOKEN`                | _(optional)_ | Bearer token for `/operations` and `/session/prompt` requests  |
-| `PROMPT_INJECTION_CHAR_LIMIT` | `12000`      | Above this length, prompts are sent as a `.txt` file attachment |
-
-### 3. Build
-
-```bash
-pnpm build
-```
-
-Compiled output is written to `dist/`.
-
----
-
-## CLI Usage
-
-### Make `openbrowser` available in your terminal
-
-The `openbrowser` command is **not** installed automatically. PowerShell shows:
+## 使用流程
 
 ```text
-openbrowser: The term 'openbrowser' is not recognized ...
+选择项目 → 描述目标 → 模型读取相关代码 → 生成方案 → 审核 Diff → 应用与验证
 ```
 
-That is expected until you complete the setup below.
+- **项目问答**：解释代码和讨论方案，不应用文件修改。
+- **修改代码**：可由模型寻找代码，再提出文件操作。应明确目标，例如“修复登录失败，保持接口兼容，并补充测试”，而不是只写“修改这个文件”。
+- **需要补充信息**：直接在“继续追问”中回答，保留同一对话。
+- **执行失败**：查看日志中的文件状态和验证结果。回滚失败或执行被强制中断时，应先人工检查文件，不要假定已经恢复。
 
-#### Option A — Global command (recommended)
+接收诊断和浏览器模式下的手动导入入口默认折叠。网页已有回复但未回传时，展开“接收详情”；不要连续重复发送。
 
-**One-time pnpm PATH setup** (required on Windows):
+### 多模型方案比较
+
+在“多模型协作”中选择 2–4 个提案者和 1 个评审，确认共享范围后运行。提案与评审可使用指定网页、手动传递或本机 Ollama；本机模型并不需要浏览器扩展。
+
+方案和评审阶段只读，不修改项目。选定方案后，确认当前源码和实施要求，创建关联实施任务并重新审核 Diff。**报告不是测试结果，选中方案也不等于批准修改。** 当前代码实施仅支持浏览器或手动传递，Ollama 尚未接入完整代码执行闭环。
+
+## CLI 与开发
+
+保留终端入口，构建后可在源码目录执行：
 
 ```powershell
-pnpm setup
+node dist/index.js ask "解释这个项目的入口和主要模块"
+node dist/index.js agent "修复一个明确的问题并提出最小修改"
 ```
 
-Close and reopen PowerShell after this command. It adds `%LOCALAPPDATA%\pnpm` to your PATH.
+CLI 以启动目录作为项目目录。CLI 和网页服务默认使用同一端口，不要同时启动两个占用 5000 的服务。首次使用建议从网页工作台和小型测试项目开始。
 
-**Register the CLI** (run from the project root after every fresh clone):
+开发检查：
 
 ```powershell
+pnpm typecheck
+pnpm test
 pnpm build
-pnpm link --global
 ```
 
-Verify in a **new** terminal:
+仓库包含协议、文件事务、验证、会话恢复、多模型流程、扩展接收和界面逻辑的自动测试。模拟网页测试不代表所有真实 AI 网站均已端到端验证，也不代表已完成独立安全审计。
 
-```powershell
-openbrowser --help
-```
+## 安全与已知限制
 
-#### Option B — Run without global install
+- **本地优先不等于离线。** 浏览器或远程模型会收到任务、项目摘要、所选文件及工具补读内容；多模型模式会向你确认的参与者发送快照和相关方案。不要提供密钥、个人隐私或无权分享的代码。
+- 服务默认只监听本机；工作台使用同源检查和启动时生成的令牌。它不是面向公网的多用户服务，请勿直接暴露端口。
+- 文件工具限制读取范围并过滤部分敏感路径，但不能保证发现所有业务秘密。模型命令执行默认禁用；安装依赖、数据库迁移和部署需自行处理。
+- 验证运行在临时项目副本中，**不是容器隔离**。脚本仍有本机文件、进程和网络权限，只验证你信任的项目；第三方脚本的外部副作用无法靠文件回滚撤销。
+- 自动重试有次数上限，不绕过服务限额、验证码或访问限制。浏览器 DOM 和回复格式可能变化，适配失效时可改用手动传递。
+- 当前单模型工作流一次只允许一个进行中的任务。未审核方案不执行；重启后旧批准失效。强制终止进程后的完整事务恢复和历史手动回滚尚未实现。
+- 正式模型 API、完整权限与预算配置、自动多模型路由、ZIP 导入、子 Agent 和容器执行器尚未完成。
 
-From the project root:
+### 本地数据与分享
 
-```powershell
-# Compiled CLI (requires pnpm build first)
-pnpm start ask "Explain this repo structure"
-pnpm start agent "Add input validation"
-pnpm start server
+会话保存在所选项目的 `.openbrowser/workbench-sessions.json`，文件操作历史位于 `.openbrowser/history.json`。会话可能包含源码和敏感文字，**当前未加密**；删除本地对话不会删除模型网站上的聊天。
 
-# Dev mode with auto-reload (no build needed)
-pnpm dev
-pnpm exec tsx src/index.ts ask "Explain this repo structure"
-```
+发布或分享前检查 Git 暂存区、提交历史及压缩包，排除 `.openbrowser/`、真实 `.env`/密钥、日志和私人截图。依赖目录与构建产物不应混入源码仓库；`.gitignore` 不会移除已经被 Git 跟踪的文件，也不会清理旧压缩包。
 
-#### Option C — Interactive dev mode
+## 常见问题
 
-```powershell
-pnpm dev
-```
+| 问题 | 检查方式 |
+| --- | --- |
+| 本地页面无法访问 | 确认 `pnpm web` 仍运行，检查 [health](http://127.0.0.1:5000/health)，查看终端端口错误。 |
+| 扩展已连接但无法发送 | 检查 AI 页面的登录、额度、附件上传和已有草稿；重新加载扩展后刷新 AI 网页。 |
+| 网页已回答，工作台仍在等待 | 展开“接收详情”，保存完整回复和日志；不要重复提交同一任务。 |
+| 模型一直问“具体改什么” | 在原会话补充目标、范围和验收要求，这不是连接错误。 |
+| 代码改了但服务还是旧版 | 重新构建并重启后端，刷新工作台；扩展代码另需重新加载。 |
 
-Starts the CLI in watch mode. With no arguments, you get an interactive menu:
+## 文档
 
-```
-Select mode:
-  1. ask
-  2. agent
-  q. exit
-mode>
-```
+- [工作台使用指南](./docs/WORKBENCH.zh-CN.md)
+- [网页连接与回复接收排查](./docs/BROWSER_DELIVERY.zh-CN.md)
+- [文件搜索与读取](./docs/FILE_DISCOVERY.zh-CN.md)
+- [上下文与补读协议](./docs/CONTEXT_PROTOCOL.zh-CN.md)
+- [多模型协作](./docs/COLLABORATION.zh-CN.md)
+- [开发路线与产品边界](./docs/PRODUCTIZATION.zh-CN.md)
+- [最初的二次开发审查](./docs/FEASIBILITY_AND_ROADMAP.zh-CN.md)
 
-Use `@path/to/file` in the prompt area for context attachments. Tab completes paths after `@`.
+## 上游与许可
 
----
+本项目基于 **1129Aliasgar** 创建的 [OpenBrowser](https://github.com/1129Aliasgar/OpenBrowser)，二次开发基线为提交 [`2f090f0`](https://github.com/1129Aliasgar/OpenBrowser/commit/2f090f0954435efb07ee35f95e04576b7c6d65fa)。浏览器桥接、CLI、项目上下文、文件操作协议及最初的 Diff 流程来源于上游；本版本不代表上游官方发行，也不暗示原作者为新增功能背书。
 
-### Commands
+Jia 的后续修改包括网页工作台、连续对话、只读文件发现、事务验证与回滚增强、多模型方案协作，以及浏览器接收适配和诊断等。
 
-```powershell
-openbrowser                          # Interactive mode (ask / agent menu)
-openbrowser ask "<prompt>"           # Ask mode — Q&A in terminal
-openbrowser agent "<task>"           # Agent mode — file ops with diff preview
-openbrowser server                   # Run bridge server only (no CLI workflow)
-openbrowser --help                   # Show all commands
-openbrowser --version                # Show version
-```
-
-### Ask mode
-
-```powershell
-openbrowser ask "How do I implement rate limiting in Fastify?"
-```
-
-1. Bridge server starts on port 5000.
-2. CLI queues the prompt with a **system instruction** (Markdown answer expected).
-3. Chrome extension receives the job instantly via SSE, injects the message into the AI composer, and clicks Send.
-4. When the AI finishes replying, the extension captures the text and posts it to the bridge.
-5. CLI receives the response over SSE and prints it in the terminal.
-
-### Agent mode
-
-```powershell
-openbrowser agent "Add a health check endpoint to the server"
-```
-
-1. Project context is generated from the current directory.
-2. CLI queues task + context + **JSON schema system instructions**.
-3. Extension auto-sends to the AI tab and waits for a JSON response with `conversationId`.
-4. CLI validates the JSON, shows unified diffs for each proposed change.
-5. Confirm with `y` to apply, or `N` to reject.
-
-All applied changes are logged under `.openbrowser/history.json`.
-
-### Long prompts (file attachment)
-
-When a prompt (including system instructions and `@` context) exceeds **12,000 characters** by default, OpenBrowser saves the full text to `.openbrowser/prompts/<session>.txt` and the extension uploads it as **`openbrowser-prompt.txt`** instead of pasting into the composer. A short note is sent in the text field telling the AI to read the attachment.
-
-Override the limit with `PROMPT_INJECTION_CHAR_LIMIT` in `.env`.
-
----
-
-## Bridge Server
-
-The bridge server is the local API that connects the CLI, browser extension, and file operations.
-
-### Start the server
-
-**Dedicated server command** (keeps running until you stop it):
-
-```powershell
-openbrowser server
-```
-
-**Dev watch mode** (auto-restarts on file changes):
-
-```powershell
-pnpm dev:server
-```
-
-**Embedded server** — `openbrowser ask` and `openbrowser agent` start the server automatically and shut it down when the command finishes.
-
-### Default URL
-
-```
-http://127.0.0.1:5000
-```
-
-### Endpoints
-
-| Method | Path                           | Description                                     |
-| ------ | ------------------------------ | ----------------------------------------------- |
-| `GET`  | `/health`                      | Health check (used by the extension popup)      |
-| `GET`  | `/summary`                     | Project context summary                         |
-| `POST` | `/session/prompt`              | CLI submits prompt job with system instructions |
-| `GET`  | `/session/:id/events`          | CLI SSE stream for completed response           |
-| `GET`  | `/session/:id/status`          | Poll session status                             |
-| `GET`  | `/browser/events`              | Extension SSE stream for new prompt jobs        |
-| `POST` | `/browser/claim`               | Extension claims a job before processing        |
-| `GET`  | `/browser/prompt-file/:id`     | Extension downloads prompt `.txt` for attachment |
-| `POST` | `/browser/chunk`               | Extension streams partial ask-mode responses    |
-| `POST` | `/browser/response`            | Extension posts AI reply back to bridge         |
-| `POST` | `/operations/preview`          | Preview diffs for operations                    |
-| `POST` | `/operations/apply`            | Apply validated operations                      |
-
-### Verify the server is running
-
-```powershell
-curl http://127.0.0.1:5000/health
-```
-
-Expected response:
-
-```json
-{ "status": "ok" }
-```
-
-Or open `http://127.0.0.1:5000/health` in your browser.
-
----
-
-## Browser Extension (Chrome)
-
-The extension watches supported AI chat pages, injects prompts, captures responses, and forwards them to the local bridge server.
-
-### Supported sites
-
-| Provider    | URL                                              |
-| ----------- | ------------------------------------------------ |
-| ChatGPT     | [chatgpt.com](https://chatgpt.com)               |
-| Gemini      | [gemini.google.com](https://gemini.google.com)   |
-| DeepSeek    | [chat.deepseek.com](https://chat.deepseek.com)   |
-| Claude      | [claude.ai](https://claude.ai)                   |
-| Perplexity  | [perplexity.ai](https://www.perplexity.ai)       |
-| GLM         | [chat.z.ai](https://chat.z.ai)                   |
-| Grok        | [grok.com](https://grok.com)                     |
-
-### Load the extension in Chrome
-
-1. **Start the bridge server** (extension needs port 5000):
-
-   ```powershell
-   openbrowser server
-   ```
-
-2. **Open Chrome extensions page**:
-
-   ```
-   chrome://extensions
-   ```
-
-3. **Enable Developer mode** (toggle in the top-right corner).
-
-4. **Click "Load unpacked".**
-
-5. **Select the `browser-extension` folder** inside this repo (the folder that contains `manifest.json`).
-
-6. **Pin the extension** — click the puzzle icon in the Chrome toolbar → pin **OpenBrowser Bridge**.
-
-7. **Verify connection** — click the extension icon. The popup should show:
-
-   ```
-   Bridge server is running on port 5000.
-   ```
-
-   If it says _"Bridge server is not reachable"_, make sure `openbrowser server` is running.
-
-### How the extension works
-
-1. You run `openbrowser ask` or `openbrowser agent` in your project directory.
-2. The CLI submits a prompt job to `POST /session/prompt` on the bridge server.
-3. The bridge pushes the job instantly over SSE to `GET /browser/events`.
-4. The content script claims the job, injects the message (or attaches `openbrowser-prompt.txt` for long prompts), and clicks Send.
-5. When the AI reply is complete, the extension posts it to `POST /browser/response`.
-6. The CLI receives the result over `GET /session/:id/events` and prints it in the terminal.
-
-> **Important:** Keep an AI chat tab open and reload it after updating the extension.
-
----
-
-## AI Response Format
-
-Agent mode expects JSON like this:
-
-```json
-{
-  "operations": [
-    {
-      "action": "CREATE_FILE",
-      "path": "src/example.ts",
-      "content": "export const hello = 'world';\n"
-    }
-  ],
-  "conversationId": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-Supported actions: `CREATE_FILE`, `EDIT_FILE`, `DELETE_FILE`, `RENAME_FILE`, `CREATE_FOLDER`.
-
-Paths must be relative to the project root. Directory traversal (`../`) is rejected.
-
----
-
-## Development
-
-```powershell
-pnpm dev           # CLI in watch mode (tsx)
-pnpm dev:server    # Bridge server in watch mode
-pnpm build         # Compile TypeScript → dist/
-pnpm typecheck     # Type-check without emitting
-pnpm test          # Run Vitest unit tests
-pnpm test:watch    # Vitest in watch mode
-```
-
-### Project layout
-
-```
-OpenBrowser/
-├── src/
-│   ├── assest/           # Logo, banner, favicon
-│   ├── index.ts          # CLI entry point
-│   ├── server/           # Bridge server (Fastify + SSE)
-│   ├── context/          # Project context & @ attachments
-│   ├── protocol/         # Zod schemas & validation
-│   ├── parser/           # AI response parsing
-│   ├── operations/       # Diff preview & file executor
-│   ├── memory/           # .openbrowser storage
-│   └── shared/           # Terminal UI, prompt delivery
-├── browser-extension/    # Chrome MV3 extension
-├── dist/                 # Compiled output (after pnpm build)
-├── .env.example
-├── CONTRIBUTING.md
-├── CODE_OF_CONDUCT.md
-├── SECURITY.md
-├── LICENSE
-├── package.json
-└── pid.md                # Full product specification
-```
-
----
-
-## Troubleshooting
-
-### `openbrowser` is not recognized (PowerShell)
-
-| Cause                       | Fix                                                |
-| --------------------------- | -------------------------------------------------- |
-| pnpm global bin not in PATH | Run `pnpm setup`, restart PowerShell               |
-| Project not built           | Run `pnpm build`                                   |
-| CLI not linked globally     | Run `pnpm link --global`, then open a new terminal |
-| Want to skip global install | Use `pnpm start ask "..."` or `pnpm dev`           |
-
-### Timed out waiting for browser AI response
-
-1. Open a supported AI site in Chrome (not Edge/Firefox alone).
-2. Reload the AI tab after installing the extension.
-3. Reload the extension on `chrome://extensions`.
-4. Confirm the popup shows _"Bridge running"_ and at least one AI tab ready.
-5. Run `openbrowser` from the project root — ask/agent start their own bridge server automatically.
-
-### Extension shows "Bridge server is not reachable"
-
-1. Confirm the server is running (started automatically by `openbrowser ask` / `openbrowser agent`).
-2. Check port 5000 is free: `curl http://127.0.0.1:5000/health`
-3. Reload the extension on `chrome://extensions`
-4. Leave `BRIDGE_TOKEN` unset for local dev (extension does not send auth headers)
-
-### Long prompt not attaching
-
-1. Confirm the provider supports file upload (ChatGPT, Claude, Gemini, DeepSeek).
-2. Check `.openbrowser/prompts/` for the saved session file.
-3. Lower `PROMPT_INJECTION_CHAR_LIMIT` to test, or shorten `@` context attachments.
-
-### Agent mode rejects the AI response
-
-- Response must be valid JSON with `operations` and `conversationId` (UUID v4).
-- No markdown code fences unless the JSON is inside them.
-- Every `path` must stay inside the project root.
-
-### Changes not applied
-
-- You must confirm with `y` after reviewing diffs.
-- Check `.openbrowser/history.json` for the operation log.
-- Run agent mode from the **project root** you want to modify.
-
----
-
-## Architecture
-
-```
-Terminal (CLI)  ──POST /session/prompt──►  Bridge :5000
-       ▲                                        │
-       │ SSE /session/:id/events                │ SSE /browser/events
-       │                                        ▼
-       └────── POST /browser/response ◄──  Chrome Extension
-                                                  │
-                                                  ▼
-                              AI chat tab (ChatGPT, Gemini, Claude, …)
-```
-
-1. **CLI** — submits prompts with system instructions, waits for responses
-2. **Bridge Server** — session queue, job dispatch, prompt file storage, response delivery
-3. **Browser Extension** — SSE job delivery, composer injection / file attach, response capture
-4. **Context Engine** — reads workspace and builds agent prompts
-5. **Operation Executor** — applies approved file changes
-
-For the full product specification, see [pid.md](./pid.md).
-
----
-
-## Contributing
-
-OpenBrowser is open source and welcomes contributions.
-
-1. Read [CONTRIBUTING.md](./CONTRIBUTING.md) for setup and PR guidelines.
-2. Follow the [Code of Conduct](./CODE_OF_CONDUCT.md).
-3. Report security issues privately — see [SECURITY.md](./SECURITY.md).
-
-**Quick start for contributors:**
-
-```bash
-git clone https://github.com/1129Aliasgar/OpenBrowser.git
-cd OpenBrowser
-pnpm install && pnpm build && pnpm test
-```
-
-Fork the repo, create a branch, and open a pull request on GitHub.
-
----
-
-## License
-
-MIT © [1129Aliasgar](https://github.com/1129Aliasgar). See [LICENSE](./LICENSE).
+采用 [MIT License](./LICENSE)：保留原始 `Copyright (c) 2026 1129Aliasgar`，并追加 `Copyright (c) 2026 Jia (modifications)`。许可允许修改和分发，但不提供可用性、安全性或适销性保证。再次分发时请保留版权声明和许可文本；使用第三方模型服务仍需遵守其条款。

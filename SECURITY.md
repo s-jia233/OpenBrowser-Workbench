@@ -1,27 +1,25 @@
-# Security Policy
+# OpenBrowser Workbench Security Policy
 
-## Supported versions
+## Development preview
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+Development is focused on the current `main` branch. Component versions are listed in [README](./README.md). This is a development preview without a production security guarantee.
 
 ## Reporting a vulnerability
 
-If you discover a security vulnerability in OpenBrowser, please report it responsibly.
+If you discover a security vulnerability in this version of OpenBrowser Workbench, please report it responsibly to this repository's maintainer.
 
 **Do not** open a public GitHub issue for security bugs.
 
-Instead, email the maintainer with:
+Contact the maintainer privately with redacted information:
 
 - A description of the vulnerability
 - Steps to reproduce
 - Potential impact (e.g. local file access, token exposure, remote code execution)
 - Your environment (OS, Node version, browser)
 
-**Contact:** Open a [GitHub Security Advisory](https://github.com/1129Aliasgar/OpenBrowser/security/advisories/new) (preferred) or email the repository owner via their GitHub profile.
+**Contact:** Use **Report a vulnerability** on [this repository's Security page](https://github.com/s-jia233/OpenBrowser-Workbench/security), if enabled. Otherwise use contact information publicly provided by [the maintainer](https://github.com/s-jia233). No dedicated security email address is currently advertised.
 
-You should receive a response within **7 days**. We will work with you to understand and address the issue before any public disclosure.
+There is no fixed response-time commitment. Do not open a public issue containing unpatched exploit details, credentials, full sessions or private source files.
 
 ## Scope
 
@@ -44,9 +42,11 @@ Out of scope (by design):
 ## Recommended practices for users
 
 - Run the bridge server only on `localhost`.
-- Set a strong random `BRIDGE_TOKEN` in `.env` if the port may be reachable from other machines on your network.
+- Do not expose the server through public interfaces, port forwarding or shared proxies. `BRIDGE_TOKEN` alone does not provide complete network isolation for all endpoints.
 - Never commit `.env` or share your `BRIDGE_TOKEN`.
-- Review agent-mode diffs before applying (`y` confirmation).
+- Review agent-mode diffs before approving file changes.
+- Verification scripts run in temporary copies but retain local process permissions, including network and filesystem access outside the copy. Do not run untrusted project scripts.
+- Browser or remote models receive tasks and relevant project context. Confirm sharing rights first. Local `.openbrowser` records and browser drafts can contain private code and must not be published.
 - Keep the Chrome extension updated from a trusted source (this repository).
 
 ## Disclosure policy

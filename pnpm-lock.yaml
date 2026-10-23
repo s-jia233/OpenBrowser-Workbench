@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  openbrowser: 'link:'
-
 importers:
 
   .:
@@ -50,9 +47,6 @@ importers:
       jsonc-parser:
         specifier: ^3.3.1
         version: 3.3.1
-      openbrowser:
-        specifier: 'link:'
-        version: 'link:'
       pino:
         specifier: ^9.5.0
         version: 9.14.0

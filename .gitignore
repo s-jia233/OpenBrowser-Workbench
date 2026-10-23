@@ -1,6 +1,14 @@
 node_modules/
+.pnpm-store/
 dist/
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.zip
 .openbrowser/
 *.log
 .DS_Store

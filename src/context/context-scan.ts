@@ -24,6 +24,7 @@ export async function scanProject(projectRoot: string): Promise<ProjectContext> 
     cwd: projectRoot,
     dot: true,
     onlyFiles: true,
+    followSymbolicLinks: false,
     ignore: CONTEXT_IGNORE,
   });
 

@@ -23,6 +23,16 @@ let streamAbort = null;
 let sseConnected = false;
 let connecting = false;
 let reconnectTimer = null;
+let lastStreamActivity = 0;
+let pulsing = false;
+let readyPageCount = 0;
+const dispatching = new Set();
+const clientIdPromise = chrome.storage.local.get('bridgeClientId').then(async (saved) => {
+  if (saved.bridgeClientId) return saved.bridgeClientId;
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({ bridgeClientId: id });
+  return id;
+});
 
 /** @type {Map<number, { host: string, lastSeen: number }>} */
 const readyTabs = new Map();
@@ -45,37 +55,44 @@ chrome.runtime.onStartup.addListener(() => {
 
 setupKeepalive();
 void connectBridgeStream();
+void pulse();
+setInterval(() => { void pulse(); }, 10_000);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM) {
     return;
   }
 
-  if (!sseConnected) {
-    void connectBridgeStream();
-  }
-
-  void flushPendingDispatches();
+  void pulse();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'OPENBROWSER_REGISTER') {
     registerTab(sender.tab);
-    void flushPendingDispatches();
-    sendResponse({ ok: true, sseConnected, readyTabs: readyTabs.size });
+    void pulse();
+    sendResponse({ ok: true, sseConnected, readyTabs: readyPageCount, identityReporting: true });
     return false;
   }
 
   if (message?.type === 'OPENBROWSER_PING') {
+    void pulse();
     if (!sseConnected) {
       void connectBridgeStream();
     }
-    sendResponse({ ok: true, sseConnected, readyTabs: readyTabs.size });
+    sendResponse({ ok: true, sseConnected, readyTabs: readyPageCount, identityReporting: true });
     return false;
   }
 
   if (message?.type === 'BRIDGE_REQUEST') {
-    bridgeRequest(message.path, message.init ?? {})
+    const init = { ...(message.init ?? {}) };
+    const request = async () => {
+      if (['/browser/claim', '/browser/response', '/browser/chunk'].includes(message.path) && sender.tab?.url) {
+        init.body = JSON.stringify({ ...JSON.parse(init.body ?? '{}'), providerHost: new URL(sender.tab.url).hostname,
+          clientId: await clientIdPromise, tabId: sender.tab.id });
+      }
+      return bridgeRequest(message.path, init);
+    };
+    request()
       .then((data) => sendResponse({ ok: true, data }))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
@@ -85,7 +102,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 function setupKeepalive() {
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+}
+
+async function pulse() {
+  if (pulsing) return;
+  pulsing = true;
+  try {
+    if (sseConnected && Date.now() - lastStreamActivity > 40_000) streamAbort?.abort();
+    if (!sseConnected && !connecting) void connectBridgeStream();
+    const tabs = await getCandidateTabs();
+    const results = await Promise.all(tabs.map(async (tab) => {
+      try {
+        return await Promise.race([
+          chrome.tabs.sendMessage(tab.id, { type: 'OPENBROWSER_STATUS' }),
+          new Promise((resolve) => setTimeout(() => resolve(null), 2500)),
+        ]);
+      } catch { readyTabs.delete(tab.id); return null; }
+    }));
+    const ready = tabs.filter((_tab, index) => results[index]?.ready);
+    const count = ready.length;
+    const readyHosts = ready.map((tab) => { try { return new URL(tab.url).hostname; } catch { return ''; } }).filter(Boolean).slice(0, 100);
+    readyPageCount = count;
+    const readyPages = ready.slice(0, 100).map((tab) => ({ tabId: tab.id, host: new URL(tab.url).hostname }));
+    await bridgeRequest('/browser/heartbeat', { method: 'POST', body: JSON.stringify({ clientId: await clientIdPromise, readyTabs: Math.min(count, 100), readyHosts, readyPages }), signal: AbortSignal.timeout(5000) });
+    await flushPendingDispatches();
+  } catch { /* Local bridge may be starting; next pulse reconnects, no AI resend. */ }
+  finally { pulsing = false; }
 }
 
 function registerTab(tab) {
@@ -115,6 +158,9 @@ async function bridgeRequest(path, init) {
   const response = await fetch(`${BRIDGE_URL}${path}`, {
     ...init,
     headers,
+    // A stalled local response must not keep a content tab's job running
+    // forever and prevent every later turn from reaching its editor.
+    signal: init.signal ?? AbortSignal.timeout(10_000),
   });
 
   if (!response.ok) {
@@ -153,18 +199,22 @@ async function connectBridgeStream() {
   connecting = true;
   streamAbort?.abort();
   streamAbort = new AbortController();
+  const connectionAbort = streamAbort;
+  const headerTimeout = setTimeout(() => connectionAbort.abort(), 10_000);
 
   try {
-    const response = await fetch(`${BRIDGE_URL}/browser/events`, {
+    const response = await fetch(`${BRIDGE_URL}/browser/events?clientId=${encodeURIComponent(await clientIdPromise)}`, {
       signal: streamAbort.signal,
       headers: { Accept: 'text/event-stream' },
     });
+    clearTimeout(headerTimeout);
 
     if (!response.ok || !response.body) {
       throw new Error(`SSE failed (${response.status})`);
     }
 
     sseConnected = true;
+    lastStreamActivity = Date.now();
     console.info('[openbrowser] Bridge SSE connected');
 
     const reader = response.body.getReader();
@@ -176,6 +226,7 @@ async function connectBridgeStream() {
       if (done) {
         break;
       }
+      lastStreamActivity = Date.now();
 
       buffer += decoder.decode(value, { stream: true });
       buffer = consumeSse(buffer, (event, data) => {
@@ -189,13 +240,10 @@ async function connectBridgeStream() {
   } catch (error) {
     sseConnected = false;
 
-    if (streamAbort?.signal.aborted) {
-      return;
-    }
-
     console.warn('[openbrowser] Bridge SSE disconnected, retrying...', error);
     scheduleReconnect();
   } finally {
+    clearTimeout(headerTimeout);
     connecting = false;
   }
 }
@@ -238,12 +286,15 @@ async function dispatchJob(job) {
   if (!job?.sessionId) {
     return;
   }
+  if (job.target && job.target.clientId !== await clientIdPromise) return;
 
-  if (dispatchedSessionIds.has(job.sessionId)) {
+  if (dispatchedSessionIds.has(job.sessionId) || dispatching.has(job.sessionId)) {
     return;
   }
-
-  const delivered = await tryDispatchJob(job);
+  dispatching.add(job.sessionId);
+  let delivered;
+  try { delivered = await tryDispatchJob(job); }
+  finally { dispatching.delete(job.sessionId); }
   if (delivered) {
     dispatchedSessionIds.add(job.sessionId);
     return;
@@ -287,6 +338,7 @@ async function flushPendingDispatches() {
     if (entry.attempts >= MAX_DISPATCH_ATTEMPTS) {
       console.warn('[openbrowser] Gave up dispatching job', entry.job.sessionId);
       pendingDispatches.splice(index, 1);
+      await bridgeRequest('/browser/response', { method: 'POST', body: JSON.stringify({ sessionId: entry.job.sessionId, ...entry.job.target, error: '没有找到指定的就绪 AI 页面，请打开并登录该网页、刷新后继续，或改用手动传递。' }) });
     }
   }
 }
@@ -295,17 +347,20 @@ async function tryDispatchJob(job) {
   const tabs = await getCandidateTabs();
 
   for (const tab of tabs) {
+    if (job.target && (job.target.clientId !== await clientIdPromise || job.target.tabId !== tab.id)) continue;
     if (!tab.id) {
       continue;
     }
 
     try {
+      const status = await chrome.tabs.sendMessage(tab.id, { type: 'OPENBROWSER_STATUS' });
+      if (!status?.ready) continue;
       const response = await chrome.tabs.sendMessage(tab.id, {
         type: 'OPENBROWSER_JOB',
         job,
       });
 
-      if (response?.ok !== false) {
+      if (response?.ok === true) {
         return true;
       }
     } catch {

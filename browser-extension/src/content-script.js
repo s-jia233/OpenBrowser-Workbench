@@ -7,11 +7,13 @@ const CHUNK_MIN_CHARS = 24;
 const CHUNK_MIN_MS = 250;
 const SEND_RETRY_MS = 250;
 const SEND_MAX_RETRIES = 20;
+const SEND_CONFIRM_TIMEOUT_MS = 5_000;
 const FILE_UPLOAD_SEND_WAIT_MS = 5_000;
 const FILE_UPLOAD_SEND_RETRY_WAIT_MS = 8_000;
 const FINISH_RECHECK_MS = 600;
 
 let running = false;
+let activeJob = null;
 const processedSessionIds = new Set();
 const jobQueue = [];
 let apiCapture = null;
@@ -23,6 +25,9 @@ const isDeepSeek = provider?.name === 'DeepSeek';
 const usesApiCapture = isChatGpt || isGemini || isDeepSeek;
 
 void registerWithBackground();
+// A page heartbeat also wakes a suspended MV3 worker while a supported AI tab
+// is open. It does not send prompts or bypass provider limits.
+setInterval(() => { void registerWithBackground(); void reconcileActiveJob(); }, 10_000);
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
@@ -31,18 +36,18 @@ document.addEventListener('visibilitychange', () => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'OPENBROWSER_JOB') {
-    void handleIncomingJob(message.job)
-      .then(() => sendResponse?.({ ok: true }))
-      .catch((error) => sendResponse?.({ ok: false, error: String(error) }));
-    return true;
+  if (message?.type === 'OPENBROWSER_STATUS') {
+    sendResponse({ ready: Boolean(provider && findPromptInput()), running, providerHost: location.hostname });
+    return false;
   }
-
-  if (message?.type === 'OPENBROWSER_RUN_JOB') {
+  if (message?.type === 'OPENBROWSER_JOB' || message?.type === 'OPENBROWSER_RUN_JOB') {
+    if (!provider || !findPromptInput()) { sendResponse({ ok: false, error: 'AI page is not ready' }); return false; }
+    // Acknowledge receipt now; claiming remains atomic on the server. Do not
+    // hold a runtime message open for the entire model generation.
+    sendResponse({ ok: true });
     void handleIncomingJob(message.job)
-      .then(() => sendResponse?.({ ok: true }))
-      .catch((error) => sendResponse?.({ ok: false, error: String(error) }));
-    return true;
+      .catch((error) => console.warn('[openbrowser] Job failed', error));
+    return false;
   }
 
   return false;
@@ -79,6 +84,7 @@ function beginApiCapture(mode, sessionId) {
     timer: null,
     lastChunkText: '',
     lastChunkAt: 0,
+    failure: null,
   };
 }
 
@@ -91,12 +97,14 @@ function endApiCapture() {
 
 function waitForApiCapturedResponse() {
   return new Promise((resolve, reject) => {
+    if (activeJob?.cancelled) { reject(activeJob.reason); return; }
     if (!apiCapture) {
       reject(new Error('AI API capture was not started.'));
       return;
     }
     apiCapture.resolve = resolve;
     apiCapture.reject = reject;
+    if (apiCapture.failure && !apiCapture.candidates.size) { const failure = apiCapture.failure; endApiCapture(); reject(failure); return; }
     apiCapture.timer = setTimeout(() => {
       const capture = apiCapture;
       apiCapture = null;
@@ -104,7 +112,18 @@ function waitForApiCapturedResponse() {
         reject(new Error('Timed out waiting for the AI provider API response.'));
       }
     }, RESPONSE_TIMEOUT_MS);
+    finishApiCapture();
   });
+}
+
+function finishApiCapture() {
+  if (!apiCapture?.resolve) return;
+  const candidate = [...apiCapture.candidates.values()].find((entry) => entry.done && entry.text);
+  if (!candidate) return;
+  const resolve = apiCapture.resolve;
+  const text = candidate.text;
+  apiCapture.replyMessageId = candidate.messageId ?? null;
+  endApiCapture(); resolve(text);
 }
 
 function bestApiCaptureText() {
@@ -143,6 +162,7 @@ function handleApiCaptureMessage(data) {
   if (data.type === 'capture-begin') {
     if ((data.at ?? 0) >= apiCapture.startedAt && !apiCapture.candidates.has(data.captureId)) {
       apiCapture.candidates.set(data.captureId, { text: '', done: false });
+      apiCapture.failure = null;
     }
     return;
   }
@@ -151,9 +171,16 @@ function handleApiCaptureMessage(data) {
   if (!candidate) {
     return;
   }
+  // Only metadata from a capture begun in this local turn may bind a DOM
+  // reply. A conversation ID alone cannot distinguish consecutive turns.
+  if (isChatGpt && ['capture-chunk', 'capture-done'].includes(data.type)
+    && Object.prototype.hasOwnProperty.call(data, 'messageId')) {
+    candidate.messageId = typeof data.messageId === 'string' && data.messageId.length > 0 && data.messageId.length <= 200
+      ? data.messageId : null;
+  }
 
   if (data.type === 'capture-chunk') {
-    if (typeof data.text === 'string' && data.text.length > candidate.text.length) {
+    if (typeof data.text === 'string') {
       candidate.text = data.text;
     }
     postBestApiChunk();
@@ -161,22 +188,29 @@ function handleApiCaptureMessage(data) {
   }
 
   if (data.type === 'capture-done') {
-    if (typeof data.text === 'string' && data.text.length > candidate.text.length) {
-      candidate.text = data.text;
-    }
-    if (candidate.text) {
-      const { resolve } = apiCapture;
-      const text = candidate.text;
-      endApiCapture();
-      resolve?.(text);
+    // Final text is authoritative even if shorter than an earlier snapshot.
+    candidate.text = typeof data.text === 'string' ? data.text : '';
+    candidate.done = true;
+    if (!candidate.text) {
+      if (apiCapture.candidates.size === 1) apiCapture.replyMessageId = candidate.messageId ?? null;
+      apiCapture.candidates.delete(data.captureId);
+      if (!apiCapture.candidates.size) {
+        apiCapture.failure = new Error('网页回复已经结束，但扩展未识别到回复正文，已释放本轮等待。请保存网页完整回复，可改用手动传递；不会自动重发。');
+        apiCapture.failure.captureCompleted = true;
+        if (apiCapture.reject) { const reject = apiCapture.reject, failure = apiCapture.failure; endApiCapture(); reject(failure); }
+      }
       return;
     }
-    apiCapture.candidates.delete(data.captureId);
+    finishApiCapture();
     return;
   }
 
   if (data.type === 'capture-error') {
     apiCapture.candidates.delete(data.captureId);
+    if (!apiCapture.candidates.size) {
+      apiCapture.failure = new Error('模型回复流中断，未将不完整内容视为最终回复。请检查 AI 网页或手动粘贴完整回复。');
+      if (apiCapture.reject) { const reject = apiCapture.reject, failure = apiCapture.failure; endApiCapture(); reject(failure); }
+    }
   }
 }
 
@@ -186,12 +220,35 @@ async function handleIncomingJob(job) {
   }
 
   if (running) {
-    jobQueue.push(job);
+    if (!jobQueue.some((entry) => entry.sessionId === job.sessionId)) jobQueue.push(job);
+    // A manually stopped/replied-to task can be terminal locally while this
+    // tab still waits for an uncaptured answer. Do not strand the follow-up.
+    await reconcileActiveJob();
     return;
   }
 
-  await runJob(job);
-  await drainJobQueue();
+  try { await runJob(job); }
+  finally { await drainJobQueue(); }
+}
+
+async function reconcileActiveJob() {
+  const active = activeJob;
+  if (!active || active.checking || active.cancelled) return;
+  active.checking = true;
+  try {
+    const state = await bridgeRequest(`/session/${encodeURIComponent(active.sessionId)}/status`);
+    if (activeJob !== active || !['complete', 'error'].includes(state?.status)) return;
+    active.cancelled = true;
+    active.reason = new Error('本地上一轮任务已结束，已停止扩展等待；没有停止 AI 网页中的生成。');
+    for (const cancel of [...active.waiters]) cancel();
+    if (apiCapture?.sessionId === active.sessionId) {
+      const reject = apiCapture.reject;
+      endApiCapture();
+      reject?.(active.reason);
+    }
+  } catch {
+    // A disconnected bridge is not proof a live AI request was cancelled.
+  } finally { active.checking = false; }
 }
 
 async function drainJobQueue() {
@@ -210,26 +267,27 @@ async function runJob(job) {
   }
 
   running = true;
+  const active = { sessionId: job.sessionId, cancelled: false, reason: null, checking: false, waiters: new Set() };
+  activeJob = active;
   try {
     let claim = await claimJob(job.sessionId);
 
-    if (!claim.claimed || !claim.job) {
-      await sleep(800);
-      claim = await claimJob(job.sessionId);
-    }
-
-    if (!claim.claimed || !claim.job) {
-      throw new Error('Could not claim OpenBrowser job. Reload this AI tab and try again.');
+    if (!claim.claimed || !claim.job || active.cancelled) {
+      // Duplicate replay or another tab already claimed it. Never fail a job
+      // owned by that tab, and never submit its prompt a second time.
+      return;
     }
 
     processedSessionIds.add(job.sessionId);
     await processJob(claim.job);
   } catch (error) {
-    await postBrowserResponse({
-      sessionId: job.sessionId,
-      error: String(error),
-    });
+    if (!active.cancelled) {
+      try { await postBrowserResponse({ sessionId: job.sessionId, error: String(error) }); }
+      catch (reportError) { console.warn('[openbrowser] Could not report job failure; releasing tab queue', reportError); }
+    }
   } finally {
+    endApiCapture();
+    if (activeJob === active) activeJob = null;
     running = false;
   }
 }
@@ -278,13 +336,15 @@ async function bridgeRequest(path, init = {}) {
 async function claimJob(sessionId) {
   return bridgeRequest('/browser/claim', {
     method: 'POST',
-    body: JSON.stringify({ sessionId }),
+    body: JSON.stringify({ sessionId, providerHost: location.hostname }),
   });
 }
 
 async function processJob(job) {
+  await waitForComposerReady();
   const beforeCount = countAssistantMessages();
   const threadIsEmpty = beforeCount === 0;
+  const chatGptTurn = isChatGpt ? snapshotChatGptTurn() : null;
 
   if (usesApiCapture) {
     beginApiCapture(job.mode, job.sessionId);
@@ -300,31 +360,280 @@ async function processJob(job) {
         throw new Error('Prompt file from bridge server was empty.');
       }
       await injectPrompt(fullMessage);
+      if (chatGptTurn) chatGptTurn.expectedPrompt = fullMessage;
       await sleep(150);
-      await clickSendWhenReady();
+      await clickSendWhenReady(fullMessage);
     } else {
-      await clickSendAfterFileAttach(
-        job.promptFileName ?? 'openbrowser-prompt.txt',
-        composerMessage,
-      );
+      if (chatGptTurn) chatGptTurn.expectedPrompt = composerMessage;
+      await clickSendAfterFileAttach(composerMessage);
     }
   } else {
     const outboundMessage = buildOutboundMessageForThread(job, threadIsEmpty);
+    if (chatGptTurn) chatGptTurn.expectedPrompt = outboundMessage;
     await injectPrompt(outboundMessage);
     await sleep(150);
-    await clickSendWhenReady();
+    await clickSendWhenReady(outboundMessage);
   }
 
-  const text = usesApiCapture
+  const text = isChatGpt
+    ? await receiveChatGptReply(job, chatGptTurn)
+    : usesApiCapture
     ? await waitForApiCapturedResponse()
     : await waitForPlainResponse(beforeCount, job.mode, job.sessionId, {
         markdownDraft: job.markdownDraft,
       });
+  if (isChatGpt && job.mode === 'agent' && chatGptCaptureIsIncomplete(text)) {
+    throw new Error('ChatGPT 回复捕获不完整，未将未闭合的 JSON 残片当成模型方案，也不会自动重发。请查看并保存网页完整回复，更新扩展后继续，或改用手动传递。');
+  }
   if (job.mode === 'ask' && job.sessionId) {
     await postBrowserChunk({ sessionId: job.sessionId, text });
   }
 
   await postBrowserResponse({ sessionId: job.sessionId, text });
+}
+
+function chatGptExplicitMessageId(node) {
+  // Both classic messages and the inspected DIL renderer expose stable IDs.
+  // Never use CSS class hashes, text fragments or the conversation ID as a
+  // substitute. Conflicting selection/source IDs are deliberately ambiguous.
+  const ids = new Set();
+  const add = (element, names) => {
+    for (const name of names) {
+      const value = element?.getAttribute?.(name);
+      if (value) ids.add(value);
+    }
+  };
+  add(node, ['data-message-id', 'data-chatgpt-selection-message-id', 'data-dil-message-id', 'data-dil-source-message-id']);
+  add(node.closest?.('[data-chatgpt-selection-message-id]'), ['data-chatgpt-selection-message-id']);
+  for (const child of node.querySelectorAll?.('[data-dil-message-id], [data-dil-source-message-id]') ?? []) {
+    add(child, ['data-dil-message-id', 'data-dil-source-message-id']);
+    if (ids.size > 1) return null;
+  }
+  return ids.size === 1 ? [...ids][0] : null;
+}
+
+function chatGptMessageId(node) {
+  const article = node.closest?.('article');
+  const testId = article?.getAttribute?.('data-testid');
+  return chatGptExplicitMessageId(node) || node.getAttribute?.('data-turn-id')
+    || article?.getAttribute?.('data-turn-id') || (/^conversation-turn-\d+$/.test(testId ?? '') ? testId : null);
+}
+
+function collectChatGptMessages(role) {
+  // Unlike generic provider fallback selectors, these are complementary:
+  // old and new turn markup can coexist after SPA rendering. Never stop at
+  // the first nonempty selector, and do not count a wrapper and its child twice.
+  const selectors = [`[data-message-author-role="${role}"]`, `article[data-turn="${role}"]`, `[data-turn="${role}"][data-testid^="conversation-turn-"]`];
+  if (role === 'assistant') selectors.push('[data-markdown-text-style="assistant-message"]');
+  const nodes = [...new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)]))];
+  return nodes.filter((node) => !nodes.some((other) => other !== node && node.contains?.(other)))
+    .sort((a, b) => {
+      const position = a.compareDocumentPosition?.(b) ?? 0;
+      return position & 1 ? 0 : position & 4 ? -1 : position & 2 ? 1 : 0;
+    });
+}
+
+function collectChatGptUsers() {
+  return collectChatGptMessages('user');
+}
+
+function chatGptPromptText(node) {
+  return String(node?.innerText ?? node?.textContent ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function snapshotChatGptTurn() {
+  const assistants = collectAssistantNodes(), users = collectChatGptUsers();
+  return {
+    assistants: new Set(assistants), assistantIds: new Set(assistants.map(chatGptMessageId).filter(Boolean)),
+    users: new Set(users), userIds: new Set(users.map(chatGptMessageId).filter(Boolean)),
+    assistantSnapshots: new Map(assistants.map((node) => [node, { id: chatGptMessageId(node) }])),
+    userSnapshots: new Map(users.map((node) => [node, { id: chatGptMessageId(node), text: chatGptPromptText(node) }])),
+  };
+}
+
+function chatGptNodeIsNew(node, nodes, ids, snapshots) {
+  const id = chatGptMessageId(node);
+  if (id && ids.has(id)) return false; // Includes remounted history.
+  return !nodes.has(node) || Boolean(id && snapshots.get(node)?.id !== id);
+}
+
+function currentChatGptEnvelope(text, conversationId) {
+  if (!conversationId || text.length > 700_000) return null;
+  const found = new Map();
+  let depth = 0, start = -1, inString = false, escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (depth && char === '"') { inString = true; continue; }
+    if (char === '{') { if (!depth) start = index; depth += 1; }
+    else if (char === '}' && depth) {
+      depth -= 1;
+      if (!depth) {
+        const candidate = text.slice(start, index + 1);
+        try {
+          const parsed = JSON.parse(candidate);
+          if (parsed.conversationId === conversationId && (Array.isArray(parsed.operations)
+            || Array.isArray(parsed.toolRequests) || Array.isArray(parsed.contextRequests) || typeof parsed.error === 'string')) {
+            found.set(JSON.stringify(parsed), candidate);
+          }
+        } catch { /* Never repair a damaged envelope or infer its source. */ }
+      }
+    }
+  }
+  return found.size === 1 ? [...found.values()][0] : null;
+}
+
+function readCurrentChatGptReply(job, baseline, capturedMessageId = null) {
+  const allUsers = collectChatGptUsers(), assistants = collectAssistantNodes();
+  const expected = baseline.expectedPrompt ? chatGptPromptText({ innerText: baseline.expectedPrompt }) : '';
+  const users = allUsers.filter((node) => {
+    if (chatGptNodeIsNew(node, baseline.users, baseline.userIds, baseline.userSnapshots)) return true;
+    // React may reuse a message element. Only a changed, exact match to the
+    // prompt actually sent can rebind it; arbitrary edits of history cannot.
+    const previous = baseline.userSnapshots.get(node)
+      ?? [...baseline.userSnapshots.values()].find((entry) => entry.id && entry.id === chatGptMessageId(node));
+    return Boolean(expected && previous && previous.text !== expected && chatGptPromptText(node) === expected);
+  });
+  const counts = `用户节点 ${allUsers.length}，本轮提问 ${users.length}，助手节点 ${assistants.length}`;
+  const matchedBy = users.length === 1 ? 'user' : 'none';
+  const metrics = { users: allUsers.length, currentUsers: users.length, assistants: assistants.length, matchedBy };
+  const empty = (reason, code, chars = 0) => ({ text: '', node: null, chars, reason, code, counts, metrics, busy: Boolean(findStopButton()), finished: false });
+  if (users.length > 1) return empty('本轮提问节点不唯一', 'ambiguous_turn');
+  const fresh = assistants.filter((node) => isElementVisible(node)
+    && chatGptNodeIsNew(node, baseline.assistants, baseline.assistantIds, baseline.assistantSnapshots));
+  const nodes = users.length === 1 ? fresh.filter((node) => {
+    const position = users[0].compareDocumentPosition?.(node) ?? 0;
+    return !(position & 1) && Boolean(position & 4);
+  }) : fresh.filter((node) => capturedMessageId && chatGptExplicitMessageId(node) === capturedMessageId);
+  // If no user anchor survives virtualization, require the exact assistant
+  // message ID from this turn's completed passive capture, never just the CI.
+  if (!users.length && nodes.length !== 1) return empty('未定位到本轮提问，且没有唯一匹配的本轮捕获消息编号', 'awaiting_turn');
+  if (!users.length) metrics.matchedBy = 'stream_id';
+  const node = nodes.at(-1);
+  if (!node) return empty('未定位到本轮新回复', 'awaiting_answer');
+  if (node.getAttribute?.('data-message-channel') === 'analysis' || node.getAttribute?.('data-channel') === 'analysis'
+    || node.closest?.('details, [data-testid="reasoning"]')) return empty('未定位到本轮最终正文', 'analysis');
+  const owner = node.closest?.('article') ?? node.closest?.('[data-chatgpt-selection-message-id]') ?? node;
+  const streaming = [node, owner].some((entry) => ['true', ''].includes(entry.getAttribute?.('data-is-streaming')))
+    || [...(owner.querySelectorAll?.('[data-is-streaming="true"], [data-is-streaming=""]') ?? [])].some(isElementVisible);
+  const busy = Boolean(findStopButton() || streaming);
+  // Read only the current assistant message. Do not scroll, copy to clipboard,
+  // remove UI nodes, rewrite code fences, or reconstruct file source.
+  // Read the complete semantic assistant root, never its first DIL word span.
+  // The word spans are inline pieces of one reply, not separate messages.
+  const root = node.getAttribute?.('data-markdown-text-style') === 'assistant-message' ? node
+    : node.querySelector?.('[data-markdown-text-style="assistant-message"], .markdown, .markdown-new-styling, .prose') ?? node;
+  if (root.closest?.('details, [data-testid="reasoning"], [data-message-channel="analysis"], [data-channel="analysis"]')) {
+    return empty('未定位到独立的本轮最终正文', 'analysis');
+  }
+  if (root === node && node.querySelector?.('details, [data-testid="reasoning"], [data-message-channel="analysis"], [data-channel="analysis"]')) {
+    return empty('最终正文与思考区域未能可靠区分', 'mixed_analysis');
+  }
+  const enabled = (button) => isElementVisible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+  const actionFinished = [...(owner.querySelectorAll?.('button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid="bad-response-turn-action-button"]') ?? [])].some(enabled);
+  // Localized action buttons may not have test IDs. Only accept exact footer
+  // labels outside the answer body; a code block's Copy button is not an end signal.
+  const footerFinished = root !== owner && [...(owner.querySelectorAll?.('button[aria-label], button[title]') ?? [])].some((button) =>
+    !root.contains?.(button) && !button.closest?.('pre, code, [data-testid="reasoning"], details') && enabled(button)
+    && ['Copy', 'Copy response', '复制', '复制回复', '复制回答', '複製', '複製回覆'].some((label) =>
+      [button.getAttribute('aria-label'), button.getAttribute('title')].includes(label)));
+  const explicitlyFinished = [node, owner].some((entry) => entry.getAttribute?.('data-is-streaming') === 'false');
+  const finished = !busy && (actionFinished || footerFinished || explicitlyFinished);
+  const raw = root.innerText ?? root.textContent ?? '';
+  const text = job.mode === 'agent' ? currentChatGptEnvelope(raw, job.conversationId) : raw.trim();
+  return { text: text ?? '', node, chars: raw.length, reason: text ? '' : '正文尚未形成唯一的本会话完整 JSON', code: text ? null : 'invalid_json', counts, metrics, busy, finished };
+}
+
+async function receiveChatGptReply(job, baseline, options = {}) {
+  const capture = apiCapture; // Retain only this turn's metadata after waiter cleanup.
+  const stream = { state: 'pending', text: '', error: null };
+  void waitForApiCapturedResponse().then((text) => {
+    stream.state = 'done'; stream.text = text;
+  }, (error) => {
+    stream.state = 'error'; stream.error = error;
+  });
+  const startedAt = Date.now(), deadline = startedAt + (options.timeoutMs ?? RESPONSE_TIMEOUT_MS);
+  let stableSince = 0, lastText = '', lastNode = null, lastPage = { chars: 0, reason: '未取得本轮正文' };
+  let lastReportAt = -Infinity, lastReportState = '';
+  const report = (page, reason) => {
+    const now = Date.now(), signature = `${reason}|${stream.state}`;
+    if (now - lastReportAt < 1000 || (signature === lastReportState && now - lastReportAt < 5000)) return;
+    if (activeJob?.cancelled) return;
+    lastReportAt = now; lastReportState = signature;
+    const clamp = (value, limit) => Math.max(0, Math.min(limit, Math.floor(value ?? 0)));
+    const reception = {
+      version: chrome.runtime.getManifest?.().version ?? '0.0.0',
+      elapsedMs: clamp(now - startedAt, 3_600_000), stream: stream.state,
+      streamChars: clamp(Math.max(stream.text.length, ...[...(capture?.candidates.values() ?? [])].map((entry) => entry.text.length)), 10_000_000), pageChars: clamp(page.chars, 10_000_000),
+      users: clamp(page.metrics?.users, 100_000), currentUsers: clamp(page.metrics?.currentUsers, 100_000),
+      assistants: clamp(page.metrics?.assistants, 100_000), matchedBy: page.metrics?.matchedBy ?? 'none',
+      reason, busy: Boolean(page.busy), finished: Boolean(page.finished),
+    };
+    // Metadata only, best effort. Diagnostic failures must not block receiving
+    // or send another model request. Existing source-tab checks still apply.
+    void bridgeRequest('/browser/chunk', { method: 'POST', body: JSON.stringify({ sessionId: job.sessionId, reception }) }).catch(() => {});
+  };
+  try {
+    while (Date.now() < deadline) {
+      if (activeJob?.cancelled) throw activeJob.reason;
+      // A complete, matching stream envelope is independent of DOM layout.
+      const validStream = stream.state === 'done' && stream.text.trim() && (job.mode === 'agent'
+        ? currentChatGptEnvelope(stream.text, job.conversationId) : !chatGptCaptureIsIncomplete(stream.text));
+      if (validStream && job.mode === 'agent') { report({}, 'returning'); return stream.text; }
+      let page;
+      try { page = readCurrentChatGptReply(job, baseline, capture?.replyMessageId); }
+      catch {
+        page = { text: '', node: null, chars: 0, reason: '未识别到本轮网页正文结构', code: 'structure_unknown', busy: Boolean(findStopButton()), finished: false };
+      }
+      lastPage = page;
+      if (validStream && !page.text) { report(page, 'returning'); return stream.text; }
+      report(page, page.busy ? 'generating' : page.code ?? (stream.state === 'done' || stream.error?.captureCompleted || page.finished ? 'settling' : 'awaiting_completion'));
+      if (page.text && !page.busy && (stream.state === 'done' || stream.error?.captureCompleted || page.finished)) {
+        if (page.text !== lastText || page.node !== lastNode) {
+          lastText = page.text; lastNode = page.node; stableSince = Date.now();
+        } else if (Date.now() - stableSince >= STABLE_MS) {
+          console.info('[openbrowser] Reply recovered from current page', { streamChars: stream.text.length, pageChars: page.chars });
+          return page.text;
+        }
+      } else { lastText = ''; lastNode = null; stableSince = 0; }
+      // A partial capture ending is not evidence that the page has finished
+      // rendering. Keep the bounded 3-minute wait even when its user anchor or
+      // localized generation control is temporarily unavailable.
+      await sleep(POLL_MS);
+    }
+    throw new Error(`ChatGPT 回复捕获不完整：已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒，流式片段 ${stream.text.length} 字，本轮网页正文 ${lastPage.chars} 字；${lastPage.reason || '未确认正文稳定且生成结束'}；${lastPage.counts ?? '消息节点统计不可用'}。未猜补内容，也不会自动重发。请保存完整回复，或改用手动传递。`);
+  } finally {
+    const pending = apiCapture;
+    if (pending?.sessionId === job.sessionId) {
+      endApiCapture();
+      // Settle the unused waiter on page recovery/timeout so its timer and
+      // closures cannot hold the tab's previous turn alive.
+      pending.resolve?.('');
+    }
+  }
+}
+
+function chatGptCaptureIsIncomplete(text) {
+  const candidate = String(text).trim().replace(/^<escape>\s*/, '').replace(/^```(?:json)?\s*/i, '');
+  if (!candidate.startsWith('{')) return false;
+  let depth = 0, inString = false, escaped = false;
+  for (const char of candidate) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') inString = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}') { depth -= 1; if (depth <= 0) return false; }
+  }
+  // This check never repairs or executes a proposal. All complete replies
+  // still go through the server's protocol/path/Diff approval validation.
+  return depth > 0 || inString;
 }
 
 function buildOutboundMessageForThread(job, threadIsEmpty) {
@@ -701,11 +1010,21 @@ async function injectPrompt(message, options = {}) {
   const preserveAttachments = options.preserveAttachments === true;
   const input = findPromptInput();
   if (!input) {
-    throw new Error('Chat input not found. Reload the AI chat tab and try again.');
+    throw new Error('未找到可编辑的 AI 输入框。请打开已登录的聊天页，刷新页面后重试。');
+  }
+  if (findStopButton()) {
+    throw new Error('AI 网页仍在生成回复，本次未发送。请等待回复结束后手动重试。');
+  }
+  if (hasComposerContent(input) && !hasInjectedContent(input, message)) {
+    throw new Error('AI 输入框已有其他草稿，本次未覆盖、未发送。请先保存或清空网页草稿后重试。');
   }
 
   input.focus();
   await sleep(100);
+  // Focus can mount a new editor; also recheck for user edits during the wait.
+  if (findPromptInput() !== input || (hasComposerContent(input) && !hasInjectedContent(input, message))) {
+    throw new Error('AI 输入框或草稿发生变化，本次未覆盖、未发送。请检查网页后手动重试。');
+  }
 
   const method = provider?.inject ?? (input instanceof HTMLTextAreaElement ? 'textarea' : 'prose-mirror');
 
@@ -728,48 +1047,21 @@ async function injectPrompt(message, options = {}) {
 }
 
 async function injectTextarea(element, text, options = {}) {
-  const preserveAttachments = options.preserveAttachments === true;
   element.focus();
-  if (preserveAttachments && hasInjectedContent(element, text)) {
+  if (options.preserveAttachments && hasInjectedContent(element, text)) {
     return;
   }
-  if (!preserveAttachments) {
-    clearComposer(element);
-    await sleep(50);
-  } else {
-    moveCaretToEnd(element);
-    await sleep(50);
-  }
-
+  // Do not assign element.value again: that can mark a controlled input's
+  // tracker as current before its input event and leave Send disabled.
   const prototype = window.HTMLTextAreaElement.prototype;
   const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
-  descriptor?.set?.call(element, text);
-  element.value = text;
-  dispatchInput(element);
-  element.dispatchEvent(new Event('change', { bubbles: true }));
-
-  if (hasInjectedContent(element, text)) {
-    dedupeInjectedTextarea(element, text);
-    return;
+  if (!descriptor?.set) {
+    throw new Error('无法写入网页输入框。请刷新 AI 页面，或使用手动发送。');
   }
-
-  document.execCommand('insertText', false, text);
+  descriptor.set.call(element, text);
+  dispatchInput(element, text);
   await sleep(50);
-  dispatchInput(element);
-  dedupeInjectedTextarea(element, text);
-}
-
-function dedupeInjectedTextarea(element, text) {
-  const expected = text.trim();
-  const actual = (element.value ?? '').trim();
-  if (!expected || !actual) {
-    return;
-  }
-
-  if (actual.length > expected.length * 1.05 && actual.includes(expected)) {
-    element.value = expected;
-    dispatchInput(element);
-  }
+  assertInjectedContent(element, text);
 }
 
 async function injectLexical(element, text, options = {}) {
@@ -790,16 +1082,12 @@ async function injectLexical(element, text, options = {}) {
   await sleep(100);
 
   if (!hasInjectedContent(element, text)) {
+    selectAll(element);
     document.execCommand('insertText', false, text);
     await sleep(100);
   }
 
-  if (!hasInjectedContent(element, text)) {
-    element.innerHTML = `<p dir="auto">${escapeHtml(text).replace(/\n/g, '<br>')}</p>`;
-  }
-
-  dedupeInjectedComposer(element, text);
-  dispatchInput(element);
+  assertInjectedContent(element, text);
 }
 
 async function injectProseMirror(element, text, options = {}) {
@@ -820,8 +1108,6 @@ async function injectProseMirror(element, text, options = {}) {
   await sleep(100);
 
   if (hasInjectedContent(element, text)) {
-    dedupeInjectedComposer(element, text);
-    dispatchInput(element);
     return;
   }
 
@@ -829,36 +1115,14 @@ async function injectProseMirror(element, text, options = {}) {
   dispatchPaste(element, text);
   await sleep(150);
 
-  if (!hasInjectedContent(element, text)) {
-    element.innerHTML = `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>`;
-  }
-
-  dedupeInjectedComposer(element, text);
-  dispatchInput(element);
+  // DOM-only writes can display text without updating the editor's document.
+  // Use native editor insertion/paste only, and fail closed if not accepted.
+  assertInjectedContent(element, text);
 }
 
-function dedupeInjectedComposer(element, text) {
-  const expected = text.trim();
-  if (!expected) {
-    return;
-  }
-
-  const actual = (
-    element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
-      ? element.value
-      : (element.textContent ?? '')
-  ).trim();
-
-  if (!actual || actual.length <= expected.length * 1.05) {
-    return;
-  }
-
-  if (actual.includes(expected) && actual.length > expected.length * 1.05) {
-    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-      element.value = expected;
-    } else {
-      element.textContent = expected;
-    }
+function assertInjectedContent(element, text) {
+  if (!hasInjectedContent(element, text)) {
+    throw new Error('AI 网页未完整接收提示词，本次未发送。请刷新 AI 页面后重试，或使用手动发送；不会用截断或重复的文本继续提交。');
   }
 }
 
@@ -889,17 +1153,42 @@ function moveCaretToEnd(element) {
 }
 
 function hasInjectedContent(element, text) {
-  const actual = (
-    element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
-      ? element.value
-      : (element.textContent ?? '')
-  ).trim();
-  const expected = text.trim();
-  if (!actual || !expected) {
-    return false;
-  }
+  const actual = normalizeComposerText(readComposerText(element));
+  const expected = normalizeComposerText(text);
+  return Boolean(expected) && actual === expected;
+}
 
-  return actual.length >= expected.length * 0.85;
+function readComposerText(element) {
+  if (!element) return '';
+  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return element.value ?? '';
+  // innerText inserts CSS paragraph spacing as extra blank lines in some
+  // editors; textContent loses block/BR line breaks. Serialize editor blocks
+  // instead, keeping real empty paragraphs and excluding placeholder BRs.
+  if (element.childNodes) return readEditorChildren(element);
+  return element.innerText ?? element.textContent ?? '';
+}
+
+function readEditorChildren(element) {
+  const children = [...element.childNodes];
+  const blocks = new Set(['P', 'DIV', 'LI', 'PRE', 'BLOCKQUOTE', 'UL', 'OL']);
+  if (blocks.has(element.tagName) && children.length === 1 && children[0].tagName === 'BR') return '';
+  let text = '', previousBlock = false;
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index];
+    if (child.nodeType !== 1 && child.nodeType !== 3) continue;
+    const block = blocks.has(child.tagName);
+    if (index > 0 && (previousBlock || block)) text += '\n';
+    if (child.nodeType === 3) text += child.textContent ?? '';
+    else if (child.tagName === 'BR') {
+      if (!child.classList.contains('ProseMirror-trailingBreak')) text += '\n';
+    } else text += readEditorChildren(child);
+    previousBlock = block;
+  }
+  return text;
+}
+
+function normalizeComposerText(text) {
+  return String(text).replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ').trim();
 }
 
 function dispatchPaste(element, text) {
@@ -914,11 +1203,15 @@ function dispatchPaste(element, text) {
       }),
     );
   } catch {
-    // Fall back to innerHTML in injectProseMirror.
+    // Native editor insertion is the only fallback; no DOM-only mutation.
   }
 }
 
 function selectAll(element) {
+  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+    element.setSelectionRange(0, element.value.length);
+    return;
+  }
   const selection = window.getSelection();
   if (!selection) {
     return;
@@ -930,40 +1223,43 @@ function selectAll(element) {
   selection.addRange(range);
 }
 
-function dispatchInput(element) {
-  element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+function dispatchInput(element, text) {
+  element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: text }));
   element.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-function setNativeValue(element, value) {
-  const prototype = Object.getPrototypeOf(element);
-  const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
-  descriptor?.set?.call(element, value);
-  element.dispatchEvent(new Event('input', { bubbles: true }));
-  element.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function canSubmitComposer(fileName) {
+function assertComposerAvailable() {
+  if (findStopButton()) {
+    throw new Error('AI 网页仍在生成回复，本次未发送。请等待回复结束后手动重试。');
+  }
   const input = findPromptInput();
-  if (input && hasComposerContent(input)) {
-    return true;
+  if (!input) {
+    throw new Error('未找到可编辑的 AI 输入框。请打开已登录的聊天页，刷新页面后重试。');
   }
-
-  if (fileName && isPromptAlreadyAttached(fileName)) {
-    return true;
+  if (hasComposerContent(input)) {
+    throw new Error('AI 输入框已有草稿，本次未覆盖、未发送。请先保存或清空网页草稿后重试。');
   }
-
-  return false;
 }
 
-async function clickSendAfterFileAttach(fileName, composerMessage) {
+async function waitForComposerReady() {
+  // Stream completion can precede the site's UI transition to an editable
+  // composer. Briefly wait for that transition, never bypass a busy page.
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    if (findPromptInput() && !findStopButton()) { assertComposerAvailable(); return; }
+    await sleep(SEND_RETRY_MS);
+  }
+  assertComposerAvailable();
+}
+
+async function clickSendAfterFileAttach(composerMessage) {
   // ChatGPT keeps send disabled while the file is still uploading.
   await sleep(FILE_UPLOAD_SEND_WAIT_MS);
 
   await injectPrompt(composerMessage, { preserveAttachments: true });
   await sleep(300);
 
-  if (await trySubmitSend(fileName)) {
+  if (await trySubmitSend(composerMessage)) {
     return;
   }
 
@@ -972,108 +1268,70 @@ async function clickSendAfterFileAttach(fileName, composerMessage) {
   await injectPrompt(composerMessage, { preserveAttachments: true });
   await sleep(300);
 
-  if (await trySubmitSend(fileName)) {
+  if (await trySubmitSend(composerMessage)) {
     return;
   }
 
-  throw new Error('Send button did not submit after file upload.');
+  throw sendUnavailableError(true);
 }
 
-async function trySubmitSend(fileName) {
+async function trySubmitSend(expected) {
   const input = findPromptInput();
-  input?.focus();
-  await sleep(100);
-
+  if (!input || !hasComposerContent(input)) return false;
+  if (!hasInjectedContent(input, expected)) {
+    throw new Error('等待发送时输入框内容发生变化，本次停止提交。请检查 AI 网页草稿后手动重试。');
+  }
+  if (findStopButton()) {
+    throw new Error('AI 网页仍在生成回复，本次未发送。请等待回复结束后手动重试。');
+  }
   const button = findSendButton();
-  if (button) {
-    button.click();
-    if (await verifyMessageSubmitted()) {
-      return true;
-    }
-
-    clickElementWithPointerEvents(button);
-    if (await verifyMessageSubmitted()) {
-      return true;
-    }
-  }
-
-  if (input && canSubmitComposer(fileName)) {
-    await submitViaEnter(input);
-    if (await verifyMessageSubmitted()) {
-      return true;
-    }
-  }
-
-  return false;
+  if (!isSendButtonEnabled(button)) return false;
+  const before = {
+    assistantCount: countAssistantMessages(),
+    userCount: countUserMessages(),
+    captureIds: new Set(apiCapture?.candidates.keys() ?? []),
+  };
+  button.click();
+  if (await verifyMessageSubmitted(before)) return true;
+  // An absent acknowledgement is ambiguous. Do not submit a second time.
+  throw new Error('已点击发送，但未确认网页是否接收；为避免重复请求，未再次发送。请先查看 AI 网页，如已有回复请先保存；确认未发送后再重试，或改用手动传递。');
 }
 
-async function clickSendWhenReady() {
+async function clickSendWhenReady(expected) {
   for (let attempt = 0; attempt < SEND_MAX_RETRIES; attempt += 1) {
-    const button = findSendButton();
-    if (button && isSendButtonEnabled(button)) {
-      button.click();
-      if (await verifyMessageSubmitted()) {
-        return;
-      }
-      clickElementWithPointerEvents(button);
-      if (await verifyMessageSubmitted()) {
-        return;
-      }
-    }
-
     const input = findPromptInput();
-    if (input && hasComposerContent(input) && attempt >= 2) {
-      await submitViaEnter(input);
-      if (await verifyMessageSubmitted()) {
-        return;
-      }
+    if (!input || !hasInjectedContent(input, expected)) {
+      throw new Error('等待发送时输入框内容发生变化，本次停止提交。请检查 AI 网页草稿后手动重试。');
     }
-
+    if (await trySubmitSend(expected)) return;
     await sleep(SEND_RETRY_MS);
   }
-
-  throw new Error('Send button stayed disabled. The page did not accept the injected prompt.');
+  throw sendUnavailableError();
 }
 
-function clickElementWithPointerEvents(element) {
-  element.focus();
-  const rect = element.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) {
-    return;
-  }
-
-  const eventInit = {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-    clientX: rect.left + rect.width / 2,
-    clientY: rect.top + rect.height / 2,
-  };
-
-  element.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-  element.dispatchEvent(new MouseEvent('mousedown', eventInit));
-  element.dispatchEvent(new PointerEvent('pointerup', eventInit));
-  element.dispatchEvent(new MouseEvent('mouseup', eventInit));
-  element.dispatchEvent(new MouseEvent('click', eventInit));
-}
-
-async function verifyMessageSubmitted() {
-  await sleep(400);
-
-  if (findStopButton()) {
-    return true;
-  }
-
-  const input = findPromptInput();
-  if (input && !hasComposerContent(input)) {
-    return true;
-  }
-
+function sendUnavailableError(afterUpload = false) {
   const button = findSendButton();
-  if (button && !isSendButtonEnabled(button)) {
-    return true;
+  if (!button) {
+    return new Error('未找到当前聊天输入区的发送按钮，可能是网页结构或语言发生变化，并不表示网页已禁用发送。本次未点击；请重新加载最新版扩展并刷新 AI 页面，或改用手动传递。');
   }
+  if (isSendButtonEnabled(button)) {
+    return new Error('发送按钮状态在等待结束时发生变化，本次未点击。请先检查网页草稿和聊天记录，确认未发送后再手动重试。');
+  }
+  return new Error(`已找到发送按钮，但${afterUpload ? '附件上传后仍' : '持续'}不可用，本次未强制提交。请查看网页的${afterUpload ? '上传状态、' : ''}登录、额度或忙碌提示，再手动重试。`);
+}
 
+function countUserMessages() {
+  return document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"], [data-testid="user-turn"]').length;
+}
+
+async function verifyMessageSubmitted(before) {
+  const deadline = Date.now() + SEND_CONFIRM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (findStopButton() || countAssistantMessages() > before.assistantCount || countUserMessages() > before.userCount) return true;
+    if ([...(apiCapture?.candidates.keys() ?? [])].some((id) => !before.captureIds.has(id))) return true;
+    await sleep(100);
+  }
+  // Disabled buttons and empty composers alone are not submission receipts.
   return false;
 }
 
@@ -1083,10 +1341,8 @@ function findStopButton() {
   }
 
   for (const selector of provider.selectors.stop) {
-    const node = document.querySelector(selector);
-    if (node && isElementVisible(node)) {
-      return node;
-    }
+    const node = [...document.querySelectorAll(selector)].find(isElementVisible);
+    if (node) return node;
   }
 
   return null;
@@ -1136,33 +1392,12 @@ function isSendButtonEnabled(button) {
 }
 
 function hasComposerContent(input) {
-  if (input instanceof HTMLTextAreaElement) {
-    return (input.value ?? '').trim().length > 0;
-  }
-
-  return (input.textContent ?? input.innerText ?? '').trim().length > 0;
-}
-
-async function submitViaEnter(input) {
-  input.focus();
-  await sleep(50);
-
-  for (const type of ['keydown', 'keypress', 'keyup']) {
-    input.dispatchEvent(
-      new KeyboardEvent(type, {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-  }
+  return normalizeComposerText(readComposerText(input)).length > 0;
 }
 
 function findSendButton() {
-  if (!provider) {
+  const input = findPromptInput();
+  if (!provider || !input) {
     return null;
   }
 
@@ -1178,15 +1413,16 @@ function findSendButton() {
     }
   }
 
-  const visible = candidates.filter((button) => isElementVisible(button));
+  const form = input.closest('form');
+  const scope = form ?? input.closest('[data-testid="composer"], [data-type="unified-composer"], .composer-parent');
+  const visible = candidates.filter((button) => isElementVisible(button)
+    && (form ? form.contains(button) || button.form === form : scope ? scope.contains(button) : !button.closest('form'))
+    && !provider.selectors.stop?.some((selector) => button.matches(selector)));
 
-  for (const button of visible) {
-    if (isSendButtonEnabled(button)) {
-      return button;
-    }
-  }
-
-  return visible[0] ?? candidates[0] ?? null;
+  const enabled = visible.filter(isSendButtonEnabled);
+  // Outside a known composer boundary, do not guess between several controls.
+  if (!scope && (enabled.length > 1 || (!enabled.length && visible.length > 1))) return null;
+  return enabled[0] ?? visible[0] ?? null;
 }
 
 async function waitForPlainResponse(beforeCount, mode, sessionId, options = {}) {
@@ -1934,7 +2170,7 @@ function collectAssistantNodes() {
   if (!provider) {
     return [];
   }
-  return queryAll(provider.selectors.assistant);
+  return isChatGpt ? collectChatGptMessages('assistant') : queryAll(provider.selectors.assistant);
 }
 
 function countAssistantMessages() {
@@ -1945,7 +2181,25 @@ function findPromptInput() {
   if (!provider) {
     return null;
   }
-  return queryFirst(provider.selectors.input);
+  const findIn = (root) => {
+    for (const selector of provider.selectors.input) {
+      const input = [...root.querySelectorAll(selector)].find((node) =>
+        isElementVisible(node) && !node.disabled && !node.readOnly
+        && node.getAttribute('aria-disabled') !== 'true'
+        && !node.matches(':disabled')
+        && (node instanceof HTMLTextAreaElement || node.isContentEditable));
+      if (input) return input;
+    }
+    return null;
+  };
+  const input = findIn(document);
+  if (input) return input;
+  for (const root of collectSearchRoots(document)) {
+    if (root === document) continue;
+    const shadowInput = findIn(root);
+    if (shadowInput) return shadowInput;
+  }
+  return null;
 }
 
 async function handleJob(job) {
@@ -1983,5 +2237,15 @@ function escapeHtml(value) {
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const active = activeJob;
+  if (!active) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (active.cancelled) return Promise.reject(active.reason);
+  return new Promise((resolve, reject) => {
+    const cancel = () => { clearTimeout(timer); active.waiters.delete(cancel); reject(active.reason); };
+    const timer = setTimeout(() => {
+      active.waiters.delete(cancel);
+      if (active.cancelled) reject(active.reason); else resolve();
+    }, ms);
+    active.waiters.add(cancel);
+  });
 }

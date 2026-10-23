@@ -60,7 +60,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at the
-[GitHub repository](https://github.com/1129Aliasgar/OpenBrowser).
+[GitHub repository](https://github.com/s-jia233/OpenBrowser-Workbench).
 
 All complaints will be reviewed and investigated promptly and fairly.
 

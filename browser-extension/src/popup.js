@@ -23,9 +23,12 @@ const pageProvider = document.querySelector('#page-provider');
 const providerList = document.querySelector('#provider-list');
 const tabsSummary = document.querySelector('#tabs-summary');
 const refreshButton = document.querySelector('#check');
+const extensionVersion = document.querySelector('#extension-version') ?? document.querySelector('.version');
+if (extensionVersion) extensionVersion.textContent = `v${chrome.runtime.getManifest().version}`;
 
 refreshButton.addEventListener('click', refreshStatus);
 refreshStatus();
+setInterval(refreshStatus, 3000);
 
 async function refreshStatus() {
   bridgeStatus.textContent = 'Checking bridge...';
@@ -38,17 +41,23 @@ async function refreshStatus() {
     chrome.tabs.query({ active: true, currentWindow: true }),
   ]);
 
-  if (bridgeOk && workerStatus?.sseConnected) {
+  if (bridgeOk && workerStatus?.sseConnected && workerStatus.readyTabs > 0) {
     setDot(bridgeDot, 'online');
-    bridgeStatus.textContent = 'Connected';
-    bridgeMeta.textContent = `${BRIDGE_URL} · SSE active · ${workerStatus.readyTabs} tab(s)`;
+    bridgeStatus.textContent = '扩展和 AI 页面已就绪';
+    bridgeMeta.textContent = workerStatus.identityReporting
+      ? `${BRIDGE_URL} · SSE active · ${workerStatus.readyTabs} tab(s) · 已启用 AI 平台上报`
+      : 'AI 页面就绪，但后台脚本未上报平台；请在扩展管理页重新加载扩展，再刷新 AI 网页。';
+  } else if (bridgeOk && workerStatus?.sseConnected) {
+    setDot(bridgeDot, 'pending');
+    bridgeStatus.textContent = '扩展已连接，AI 页面未就绪';
+    bridgeMeta.textContent = '请登录 AI 网页并刷新，等待输入框出现';
   } else if (bridgeOk) {
     setDot(bridgeDot, 'pending');
-    bridgeStatus.textContent = 'Bridge up, extension connecting...';
+    bridgeStatus.textContent = '本地服务正常，扩展正在重连…';
     bridgeMeta.textContent = `${BRIDGE_URL} · reload AI tab if jobs do not arrive`;
   } else {
     setDot(bridgeDot, 'offline');
-    bridgeStatus.textContent = 'Offline';
+    bridgeStatus.textContent = '本地服务未连接';
     bridgeMeta.textContent = 'Run openbrowser in your project folder';
   }
 
@@ -76,7 +85,7 @@ async function refreshStatus() {
 async function checkBridge() {
   try {
     const started = performance.now();
-    const response = await fetch(`${BRIDGE_URL}/health`);
+    const response = await fetch(`${BRIDGE_URL}/health`, { signal: AbortSignal.timeout(5000) });
     if (!response.ok) {
       return false;
     }

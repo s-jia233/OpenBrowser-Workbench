@@ -12,6 +12,7 @@ const operationActions = [
 const relativePathSchema = z
   .string()
   .min(1)
+  .max(512)
   .transform((value) => value.replace(/\\/g, '/').replace(/^\.\//, ''))
   .refine((value) => !value.startsWith('/'), 'Path must be relative')
   .refine((value) => !/^[a-zA-Z]:\//.test(value), 'Path must not be absolute')
@@ -84,19 +85,48 @@ export const operationSchema = z.object({
   }
 });
 
+export const fileToolRequestSchema = z.discriminatedUnion('tool', [
+  z.object({ tool: z.literal('list_files'), path: relativePathSchema.default('.'), depth: z.number().int().min(1).max(4).default(2) }).strict(),
+  z.object({ tool: z.literal('search'), path: relativePathSchema.default('.'), query: z.string().min(1).max(200).refine((value) => !!value.trim(), 'Search text cannot be blank'), caseSensitive: z.boolean().default(false) }).strict(),
+  z.object({ tool: z.literal('read_file'), path: relativePathSchema, startLine: z.number().int().positive().optional(), endLine: z.number().int().positive().optional() }).strict(),
+]).superRefine((request, ctx) => {
+  if (request.tool === 'read_file' && ((request.startLine === undefined) !== (request.endLine === undefined) ||
+    (request.startLine !== undefined && request.endLine !== undefined && (request.endLine < request.startLine || request.endLine - request.startLine >= 200)))) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Read both startLine/endLine, at most 200 lines; omit both for full text.' });
+  }
+});
+export type FileToolRequest = z.infer<typeof fileToolRequestSchema>;
+
 export const aiResponseSchema = z
   .object({
     operations: z.array(operationSchema).optional(),
+    toolRequests: z.array(fileToolRequestSchema).min(1).max(4).optional(),
+    contextRequests: z.array(z.object({
+      path: relativePathSchema,
+      startLine: z.number().int().positive().optional(),
+      endLine: z.number().int().positive().optional(),
+    }).superRefine((request, ctx) => {
+      if ((request.startLine === undefined) !== (request.endLine === undefined) ||
+        (request.startLine !== undefined && request.endLine !== undefined && (request.endLine < request.startLine || request.endLine - request.startLine >= 200))) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Use both startLine/endLine, inclusive, at most 200 lines.' });
+      }
+    })).min(1).max(4).optional(),
     conversationId: z.string().uuid(),
     error: z.string().nullable().optional(),
   })
   .superRefine((payload, ctx) => {
-    if (!payload.error && !payload.operations) {
+    if (!payload.error && !payload.operations && !payload.contextRequests && !payload.toolRequests) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'operations is required when error is not set',
         path: ['operations'],
       });
+    }
+    if (payload.contextRequests && (payload.operations?.length || payload.error)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Context requests cannot be mixed with changes or errors.' });
+    }
+    if (payload.toolRequests && (payload.operations?.length || payload.error || payload.contextRequests)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Read-only tool requests cannot be mixed with changes, errors or contextRequests.' });
     }
   });
 

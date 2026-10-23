@@ -59,6 +59,7 @@ export type TrackerStep =
   | 'renaming file'
   | 'creating folder'
   | 'running command'
+  | 'testing'
   | 'waiting'
   | 'complete';
 
@@ -72,6 +73,7 @@ const STEP_COLORS: Record<TrackerStep, string> = {
   'renaming file': colors.magenta,
   'creating folder': colors.cyan,
   'running command': colors.orange,
+  testing: colors.cyan,
   waiting: colors.gray,
   complete: colors.green,
 };

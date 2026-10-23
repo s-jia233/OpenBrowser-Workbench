@@ -850,21 +850,13 @@ export function validateMergedFileOperations(
   for (const operation of operations) {
     if (operation.action === 'CREATE_FILE') {
       if (!operation.content?.trim()) {
-        const mdHint = isMarkdownPath(operation.path ?? '')
-          ? 'Add ONE ```markdown ... ``` fenced block with full raw markdown source after the JSON.'
-          : isYamlPath(operation.path ?? '')
-            ? `Add an OpenBrowser YAML block: ${OB_FILE_BEGIN} ${operation.path}--- with real line breaks ... ${OB_FILE_END}.`
-            : `Add an OpenBrowser file block: ${OB_FILE_BEGIN} ${operation.path}--- ... ${OB_FILE_END} (path must match exactly).`;
-        throw new Error(`Missing content for ${operation.path}. ${mdHint}`);
+        throw new Error(`Missing content for ${operation.path}. Include the complete source as a JSON content string.`);
       }
     }
 
     if (operation.action === 'EDIT_FILE') {
       if (!hasEditPayload(operation)) {
-        const mdHint = isMarkdownPath(operation.path ?? '')
-          ? 'Use a ```markdown ... ``` block with full content, or startLine/endLine/replace for partial edits.'
-          : `Use ${OB_FILE_BEGIN} ${operation.path}--- with full content, or startLine/endLine/replace for partial edits.`;
-        throw new Error(`Missing content for ${operation.path}. ${mdHint}`);
+        throw new Error(`Missing edit for ${operation.path}. Include search/replace, startLine/endLine/replace, or a complete JSON content string.`);
       }
     }
 

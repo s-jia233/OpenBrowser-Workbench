@@ -1,7 +1,17 @@
 {
   "name": "openbrowser",
   "version": "0.1.0",
-  "description": "Free AI coding agent and harness — use ChatGPT, Claude, or Gemini via browser. No API key. Local CLI for free coding with your browser AI subscription.",
+  "description": "Local AI coding workbench with browser AI delivery, reviewed diffs, verification, rollback and multi-model collaboration.",
+  "author": "Jia",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/s-jia233/OpenBrowser-Workbench.git"
+  },
+  "homepage": "https://github.com/s-jia233/OpenBrowser-Workbench#readme",
+  "bugs": {
+    "url": "https://github.com/s-jia233/OpenBrowser-Workbench/issues"
+  },
   "keywords": [
     "ai-agent",
     "ai-tool",
@@ -28,13 +38,15 @@
     "openbrowser": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "web"
   ],
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:server": "tsx watch src/server/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "web": "node dist/index.js web",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -57,7 +69,6 @@
     "fs-extra": "^11.2.0",
     "gradient-string": "^3.0.0",
     "jsonc-parser": "^3.3.1",
-    "openbrowser": "link:",
     "pino": "^9.5.0",
     "zod": "^3.23.8"
   },

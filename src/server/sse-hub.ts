@@ -1,8 +1,10 @@
 import type { ServerResponse } from 'node:http';
-import type { PromptSession } from './session-store.js';
+import { getSession, type PromptSession, type BrowserTarget } from './session-store.js';
+import { identifyAi, type AiIdentity } from '../shared/ai-identity.js';
 import type { PromptDelivery } from '../shared/prompt-delivery.js';
 
 export interface BrowserJobEvent {
+  target?: BrowserTarget;
   sessionId: string;
   mode: PromptSession['mode'];
   message: string;
@@ -20,17 +22,63 @@ interface SseClient {
 }
 
 const browserClients = new Set<SseClient>();
+const browserClientIds = new Map<SseClient, string>();
+const bridges = new Map<string, { lastSeen: number; readyTabs: number; readyHosts?: string[]; readyPages?: { tabId: number; host: string }[] }>();
+const BRIDGE_TTL = 45_000;
 const sessionClients = new Map<string, Set<SseClient>>();
-const pendingBrowserJobs: BrowserJobEvent[] = [];
+const pendingBrowserJobs = new Map<string, BrowserJobEvent>();
+
+export function browserConnectionCount(): number {
+  return browserConnectionStatus().browserConnections;
+}
+
+export function recordBrowserHeartbeat(clientId: string, readyTabs: number, readyHosts?: string[], readyPages?: { tabId: number; host: string }[]): void {
+  bridges.set(clientId, { lastSeen: Date.now(), readyTabs, readyHosts: readyHosts?.slice(0, readyTabs), readyPages: readyPages?.slice(0, readyTabs) });
+  for (const [id, bridge] of bridges) if (Date.now() - bridge.lastSeen > BRIDGE_TTL) bridges.delete(id);
+}
+
+export function browserConnectionStatus() {
+  const live = [...bridges.values()].filter((bridge) => Date.now() - bridge.lastSeen <= BRIDGE_TTL);
+  const legacy = [...browserClients].filter((client) => !browserClientIds.has(client)).length;
+  const providers = new Map<string, AiIdentity>();
+  for (const bridge of live) for (const host of bridge.readyHosts ?? []) {
+    const identity = identifyAi(host);
+    if (identity) providers.set(identity.id, identity);
+  }
+  return { browserConnections: live.length + legacy, transportConnections: browserClients.size, targets: browserTargets(),
+    providers: [...providers.values()], identityReported: live.some((bridge) => bridge.readyHosts !== undefined),
+    readyTabs: live.length ? live.reduce((total, bridge) => total + bridge.readyTabs, 0) : null,
+    state: live.length ? (live.some((bridge) => bridge.readyTabs > 0) ? 'ready' : 'no_tab') : legacy ? 'legacy' : 'disconnected' };
+}
+
+export function browserTargets() {
+  return [...bridges].filter(([, bridge]) => Date.now() - bridge.lastSeen <= BRIDGE_TTL)
+    .flatMap(([clientId, bridge]) => (bridge.readyPages ?? []).flatMap((page) => {
+      const ai = identifyAi(page.host);
+      return ai ? [{ id: `${clientId}:${page.tabId}`, clientId, tabId: page.tabId, host: ai.host, name: ai.name }] : [];
+    }));
+}
+
+export function isTrustedBridgeOrigin(origin?: string): boolean {
+  if (!origin) {
+    return true;
+  }
+
+  try {
+    return new URL(origin).protocol === 'chrome-extension:';
+  } catch {
+    return false;
+  }
+}
 
 export function applyCorsHeaders(
   raw: ServerResponse,
   origin?: string,
 ): void {
-  if (origin) {
+  if (origin && isTrustedBridgeOrigin(origin)) {
     raw.setHeader('Access-Control-Allow-Origin', origin);
     raw.setHeader('Vary', 'Origin');
-  } else {
+  } else if (!origin) {
     raw.setHeader('Access-Control-Allow-Origin', '*');
   }
 
@@ -40,6 +88,11 @@ export function applyCorsHeaders(
 }
 
 export function writeCorsPreflight(raw: ServerResponse, origin?: string): void {
+  if (!isTrustedBridgeOrigin(origin)) {
+    raw.writeHead(403);
+    raw.end();
+    return;
+  }
   applyCorsHeaders(raw, origin);
   raw.writeHead(204);
   raw.end();
@@ -75,33 +128,39 @@ export function createSseStream(
   return client;
 }
 
-export function addBrowserClient(client: SseClient): void {
+export function addBrowserClient(client: SseClient, clientId?: string): void {
   browserClients.add(client);
+  if (clientId) {
+    // Only one stream per extension instance. A reconnect replaces a half-open one.
+    for (const [old, id] of browserClientIds) if (id === clientId) { removeBrowserClient(old); old.close(); }
+    browserClientIds.set(client, clientId);
+  }
   client.write('event: connected\n');
   client.write('data: {"ok":true}\n\n');
 
-  while (pendingBrowserJobs.length > 0) {
-    const job = pendingBrowserJobs.shift();
-    if (!job) {
-      break;
-    }
+  for (const [sessionId, job] of pendingBrowserJobs) {
+    if (getSession(sessionId)?.status !== 'pending') { pendingBrowserJobs.delete(sessionId); continue; }
+    if (job.target && job.target.clientId !== clientId) continue;
     client.write(`event: job\ndata: ${JSON.stringify(job)}\n\n`);
   }
 }
 
 export function removeBrowserClient(client: SseClient): void {
   browserClients.delete(client);
+  browserClientIds.delete(client);
 }
 
 export function broadcastBrowserJob(job: BrowserJobEvent): void {
   const payload = `event: job\ndata: ${JSON.stringify(job)}\n\n`;
 
-  if (browserClients.size === 0) {
-    pendingBrowserJobs.push(job);
-    return;
-  }
+  // Retain until claim, not until write: an extension can sleep between receipt
+  // and claim. Replaying pending jobs is safe because claiming is atomic.
+  for (const id of pendingBrowserJobs.keys()) if (getSession(id)?.status !== 'pending') pendingBrowserJobs.delete(id);
+  pendingBrowserJobs.set(job.sessionId, job);
+  if (pendingBrowserJobs.size > 100) pendingBrowserJobs.delete(pendingBrowserJobs.keys().next().value!);
 
   for (const client of browserClients) {
+    if (job.target && job.target.clientId !== browserClientIds.get(client)) continue;
     client.write(payload);
   }
 }
@@ -183,6 +242,8 @@ export function startSessionHeartbeat(
 
 export function clearSseHub(): void {
   browserClients.clear();
+  browserClientIds.clear();
+  bridges.clear();
   sessionClients.clear();
-  pendingBrowserJobs.length = 0;
+  pendingBrowserJobs.clear();
 }

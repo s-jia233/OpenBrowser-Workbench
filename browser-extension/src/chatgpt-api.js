@@ -1,6 +1,6 @@
 (() => {
   const HOSTS = ['chatgpt.com', 'chat.openai.com'];
-  const CAPTURE_PATHS = ['/backend-api/f/conversation'];
+  const CAPTURE_PATHS = ['/backend-api/f/conversation', '/backend-api/conversation'];
   const CAPTURE_METHOD = 'POST';
   const CHUNK_POST_MIN_MS = 120;
 
@@ -15,7 +15,7 @@
   }
 
   function partIndexFromPath(path) {
-    const match = /^\/message\/content\/parts\/(\d+)/.exec(path ?? '');
+    const match = /^\/message\/content\/parts\/(\d+)$/.exec(path ?? '');
     return match ? Number(match[1]) : null;
   }
 
@@ -24,46 +24,63 @@
     return keys.map((key) => state.fragments.get(key)).join('\n\n');
   }
 
-  function handleDelta(data, state) {
+  function acceptMessageSnapshot(message, state) {
+    if (!message || typeof message !== 'object') return;
+    const channel = message.channel ?? message.metadata?.channel;
+    state.role = message.author?.role;
+    state.messageId = state.role === 'assistant' && typeof message.id === 'string' ? message.id : null;
+    state.status = message.status;
+    state.endTurn = message.end_turn === true;
+    state.accepting = state.role === 'assistant' && (!channel || channel === 'final');
+    state.currentPath = null;
+    state.done = false;
+    if (!state.accepting) return;
+    if (message.content?.content_type === 'text' && Array.isArray(message.content.parts)) {
+      // Full snapshots are authoritative, including shorter final answers.
+      state.fragments = new Map(message.content.parts.flatMap((part, index) => typeof part === 'string' ? [[index, part]] : []));
+      state.currentPath = '/message/content/parts/0';
+      state.currentOperation = 'append';
+    }
+    if (state.status === 'finished_successfully' && state.endTurn) state.done = true;
+  }
+
+  function handleDelta(data, state, basePath = '') {
+    if (Array.isArray(data)) { for (const patch of data) handleDelta(patch, state, basePath); return; }
     if (!data || typeof data !== 'object') return;
     const value = data.v;
-
-    if (data.o && typeof data.p === 'string') {
-      state.currentPath = data.p;
-      const index = partIndexFromPath(data.p);
-      if (index !== null && typeof value === 'string') {
-        const existing = state.fragments.get(index) ?? '';
-        state.fragments.set(index, data.o === 'replace' ? value : existing + value);
-      }
+    const explicit = typeof data.p === 'string' ? data.p : null;
+    const path = explicit === null ? state.currentPath
+      : explicit.startsWith('/') ? explicit : `${basePath}/${explicit}`.replace(/\/$/, '');
+    const operation = String(data.o ?? state.currentOperation).toLowerCase();
+    if (Array.isArray(value) && ['patch', 'batch'].includes(operation)) {
+      for (const patch of value) handleDelta(patch, state, path ?? basePath);
       return;
     }
-
-    if (typeof value === 'string') {
-      const index = partIndexFromPath(state.currentPath);
-      if (index !== null) {
-        const existing = state.fragments.get(index) ?? '';
-        state.fragments.set(index, existing + value);
-      }
+    const snapshot = data.message ?? value?.message ?? (path === '/message' ? value : null);
+    if (snapshot) { acceptMessageSnapshot(snapshot, state); return; }
+    if (explicit !== null) state.currentPath = path;
+    if (data.o) state.currentOperation = operation;
+    if (path === '/message/channel' && typeof value === 'string') {
+      state.accepting = state.role === 'assistant' && value === 'final';
+      state.fragments.clear();
+      state.currentPath = null;
+      state.done = false;
       return;
     }
-
-    if (value && typeof value === 'object' && value.message) {
-      const message = value.message;
-      if (
-        message.author?.role === 'assistant' &&
-        message.content?.content_type === 'text' &&
-        Array.isArray(message.content.parts)
-      ) {
-        for (let index = 0; index < message.content.parts.length; index += 1) {
-          const part = message.content.parts[index];
-          if (typeof part === 'string' && !state.fragments.has(index)) {
-            state.fragments.set(index, part);
-          }
-        }
-        if (message.status === 'finished_successfully' && message.end_turn === true) {
-          state.done = true;
-        }
-      }
+    if (!state.accepting) return;
+    if (path === '/message/status') state.status = value;
+    if (path === '/message/end_turn') state.endTurn = value === true;
+    if (['/message/status', '/message/end_turn'].includes(path)
+      && state.status === 'finished_successfully' && state.endTurn) state.done = true;
+    const index = partIndexFromPath(path);
+    if (index !== null && typeof value === 'string') {
+      state.done = false;
+      const existing = state.fragments.get(index) ?? '';
+      if (operation === 'append') state.fragments.set(index, existing + value);
+      else if (['replace', 'set', 'add'].includes(operation)) state.fragments.set(index, value);
+    } else if (path === '/message/content/parts' && Array.isArray(value) && ['replace', 'set', 'add'].includes(operation)) {
+      state.done = false;
+      state.fragments = new Map(value.flatMap((part, index) => typeof part === 'string' ? [[index, part]] : []));
     }
   }
 
@@ -85,6 +102,7 @@
     const rawData = dataLines.join('\n');
     if (rawData === '[DONE]') {
       state.done = true;
+      state.transportDone = true;
       return;
     }
 
@@ -95,18 +113,29 @@
       return;
     }
 
-    if (event === 'delta') {
-      handleDelta(data, state);
+    // Completion metadata is not a text patch, even when its event label is
+    // delta. Check it before the delta dispatcher rather than waiting for EOF.
+    if (event === 'message_stream_complete' || data?.type === 'message_stream_complete') {
+      state.done = true;
       return;
     }
 
-    if (data && typeof data === 'object' && data.type === 'message_stream_complete') {
-      state.done = true;
+    // ChatGPT can omit event: delta on subsequent compact packets. SSE then
+    // defaults to "message"; do not silently drop their p/o/v content.
+    // Only accept the patch envelope, not unrelated typed metadata.
+    const compactPatch = event === 'message' && (Array.isArray(data) || (
+      data && typeof data === 'object' && Object.keys(data).length > 0
+      && Object.keys(data).every((key) => ['p', 'o', 'v'].includes(key))
+      && ('v' in data || 'p' in data)
+    ));
+    if (event === 'delta' || data?.message || data?.v?.message || compactPatch) {
+      handleDelta(data, state);
+      return;
     }
   }
 
   function createState() {
-    return { fragments: new Map(), currentPath: null, done: false };
+    return { fragments: new Map(), currentPath: null, currentOperation: 'append', role: null, messageId: null, accepting: false, done: false, transportDone: false };
   }
 
   async function readCaptureStream(stream, captureId, state) {
@@ -120,7 +149,8 @@
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        // Normalize after concatenation so a CR/LF split across chunks is safe.
+        buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, '\n');
 
         let separator;
         while ((separator = buffer.indexOf('\n\n')) !== -1) {
@@ -132,42 +162,41 @@
           if (text && text !== lastText && Date.now() - lastChunkAt >= CHUNK_POST_MIN_MS) {
             lastText = text;
             lastChunkAt = Date.now();
-            post({ type: 'capture-chunk', captureId, text });
+            post({ type: 'capture-chunk', captureId, text, messageId: state.accepting ? state.messageId : null });
           }
-          if (state.done) break;
+          // A message-level completion is not the end of this HTTP response.
+          // Keep consuming the page's existing stream: a later final snapshot
+          // or delta may still supersede the current prefix. Only the global
+          // DONE sentinel may end this branch before transport EOF.
+          if (state.transportDone) break;
         }
-        if (state.done) break;
+        if (state.transportDone) break;
       }
 
-      if (buffer) {
+      if (buffer && !state.transportDone) {
         handleSseBlock(buffer, state);
       }
-
-      post({ type: 'capture-done', captureId, text: textFromState(state) });
+      if (!state.done) throw new Error('ChatGPT response stream ended before a completion marker.');
+      post({ type: 'capture-done', captureId, text: textFromState(state), messageId: state.accepting ? state.messageId : null });
     } catch (error) {
-      const partialText = textFromState(state);
-      if (partialText) {
-        post({ type: 'capture-done', captureId, text: partialText });
-      } else {
-        post({
-          type: 'capture-error',
-          captureId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+      post({ type: 'capture-error', captureId, error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      // Cancel only the tee's capture branch, never the page's response stream.
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
   }
 
   function shouldCapture(url, method) {
     try {
       const parsed = new URL(url, window.location.origin);
-      return method === CAPTURE_METHOD && CAPTURE_PATHS.some((path) => parsed.pathname.endsWith(path));
+      return parsed.origin === window.location.origin && method === CAPTURE_METHOD && CAPTURE_PATHS.includes(parsed.pathname);
     } catch {
       return false;
     }
   }
 
-  function captureResponse(response) {
+  function captureResponse(response, requestAt) {
     const captureId =
       typeof crypto?.randomUUID === 'function'
         ? crypto.randomUUID()
@@ -181,7 +210,8 @@
     const [pageStream, captureStream] = response.body.tee();
     const forPage = new Response(pageStream, response);
     const state = createState();
-    post({ type: 'capture-begin', captureId, at: Date.now() });
+    // A slow response from a cancelled previous turn must not join a new turn.
+    post({ type: 'capture-begin', captureId, at: requestAt });
     void readCaptureStream(captureStream, captureId, state);
     return forPage;
   }
@@ -189,12 +219,13 @@
   window.fetch = async function (...args) {
     const input = args[0];
     const init = args[1] ?? {};
-    const url = typeof input === 'string' ? input : input?.url;
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url;
     const method = String(init.method ?? input?.method ?? 'GET').toUpperCase();
+    const requestAt = Date.now();
     const response = await originalFetch(...args);
     if (!shouldCapture(url, method) || !response?.body) {
       return response;
     }
-    return captureResponse(response);
+    return captureResponse(response, requestAt);
   };
 })();

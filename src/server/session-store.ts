@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
+import type { AiIdentity } from '../shared/ai-identity.js';
 import type { PromptDelivery } from '../shared/prompt-delivery.js';
+import type { BrowserReception } from '../shared/browser-reception.js';
 
 export type SessionMode = 'ask' | 'agent';
+export interface BrowserTarget { clientId: string; tabId: number }
 
 export type SessionStatus =
   | 'pending'
@@ -26,9 +29,14 @@ export interface PromptSession {
   createdAt: string;
   claimedAt?: string;
   completedAt?: string;
+  ai?: AiIdentity;
+  target?: BrowserTarget;
+  claimedBy?: BrowserTarget;
+  reception?: BrowserReception;
 }
 
 export interface CreateSessionInput {
+  target?: BrowserTarget;
   mode: SessionMode;
   prompt: string;
   systemPrompt: string;
@@ -44,6 +52,7 @@ const sessions = new Map<string, PromptSession>();
 export function createSession(input: CreateSessionInput): PromptSession {
   const session: PromptSession = {
     id: crypto.randomUUID(),
+    target: input.target,
     mode: input.mode,
     prompt: input.prompt,
     systemPrompt: input.systemPrompt,
@@ -62,7 +71,7 @@ export function createSession(input: CreateSessionInput): PromptSession {
 
 export function claimPendingSession(): PromptSession | null {
   for (const session of sessions.values()) {
-    if (session.status !== 'pending') {
+    if (session.status !== 'pending' || session.target) {
       continue;
     }
 
@@ -74,14 +83,17 @@ export function claimPendingSession(): PromptSession | null {
   return null;
 }
 
-export function tryClaimSession(sessionId: string): PromptSession | null {
+export function tryClaimSession(sessionId: string, ai?: AiIdentity, claimant?: BrowserTarget): PromptSession | null {
   const session = sessions.get(sessionId);
   if (!session || session.status !== 'pending') {
     return null;
   }
+  if (session.target && (!claimant || session.target.clientId !== claimant.clientId || session.target.tabId !== claimant.tabId)) return null;
 
   session.status = 'claimed';
   session.claimedAt = new Date().toISOString();
+  session.ai = ai;
+  session.claimedBy = claimant ? { ...claimant } : undefined;
   return session;
 }
 
@@ -93,6 +105,10 @@ export function releaseClaim(sessionId: string): PromptSession | undefined {
 
   session.status = 'pending';
   session.claimedAt = undefined;
+  session.claimedBy = undefined;
+  session.ai = undefined;
+  session.partialText = undefined;
+  session.reception = undefined;
   return session;
 }
 
@@ -105,7 +121,7 @@ export function updateSessionPartial(
   partialText: string,
 ): PromptSession | undefined {
   const session = sessions.get(sessionId);
-  if (!session) {
+  if (!session || !['pending', 'claimed'].includes(session.status)) {
     return undefined;
   }
 
@@ -113,9 +129,17 @@ export function updateSessionPartial(
   return session;
 }
 
+export function updateSessionReception(sessionId: string, reception: BrowserReception): boolean {
+  const session = sessions.get(sessionId);
+  if (!session || session.status !== 'claimed') return false;
+  if (session.reception && session.reception.elapsedMs > reception.elapsedMs) return false;
+  session.reception = reception;
+  return true;
+}
+
 export function completeSession(sessionId: string, response: string): PromptSession | undefined {
   const session = sessions.get(sessionId);
-  if (!session) {
+  if (!session || !['pending', 'claimed'].includes(session.status)) {
     return undefined;
   }
 
@@ -127,7 +151,7 @@ export function completeSession(sessionId: string, response: string): PromptSess
 
 export function failSession(sessionId: string, error: string): PromptSession | undefined {
   const session = sessions.get(sessionId);
-  if (!session) {
+  if (!session || !['pending', 'claimed'].includes(session.status)) {
     return undefined;
   }
 

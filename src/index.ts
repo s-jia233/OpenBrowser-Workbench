@@ -2,7 +2,7 @@
 import crypto from 'node:crypto';
 import { stdout as output } from 'node:process';
 import { Command } from 'commander';
-import { submitPrompt, waitForSessionResponse } from './client/bridge-client.js';
+import { createBrowserBackend } from './backends/index.js';
 import {
   formatAgentContextJson,
   formatContextMarkdown,
@@ -13,6 +13,8 @@ import {
   readBufferedPrompt,
 } from './context/index.js';
 import { parseAIResponse } from './parser/index.js';
+import { expandAgentContext, assertContextEdits } from './context/agent-context.js';
+import { runFileTools, MAX_FILE_TOOL_ROUNDS } from './context/file-tools.js';
 import { executeOperations, planOperations } from './operations/index.js';
 import {
   buildAgentSystemPrompt,
@@ -23,6 +25,7 @@ import {
 } from './prompts/system.js';
 import { extractMarkdownDraftContent } from './parser/markdown-agent.js';
 import { startServer } from './server/index.js';
+import { runVerificationInSandbox } from './verification/index.js';
 import {
   PROMPT_FILE_NAME,
   PROMPT_INJECTION_CHAR_LIMIT,
@@ -50,6 +53,7 @@ import {
 
 const program = new Command();
 const DEFAULT_PORT = Number(process.env.PORT ?? 5000);
+const modelBackend = createBrowserBackend(DEFAULT_PORT);
 
 const sessionPrimingState = {
   askPrimed: false,
@@ -86,6 +90,15 @@ program
       printBanner();
       await runAgent(task);
     });
+  });
+
+program
+  .command('web')
+  .description('Start the local browser workbench at http://127.0.0.1:5000')
+  .action(async () => {
+    await startServer({ port: DEFAULT_PORT });
+    console.log(`OpenBrowser 工作台：http://127.0.0.1:${DEFAULT_PORT}`);
+    console.log('在浏览器打开此地址。按 Ctrl+C 停止服务。');
   });
 
 program
@@ -178,9 +191,7 @@ async function readPromptWithContext(
 }
 
 async function waitForBrowserResponse(sessionId: string): Promise<string> {
-  return waitForSessionResponse(sessionId, {
-    port: DEFAULT_PORT,
-  });
+  return modelBackend.waitForResponse(sessionId);
 }
 
 function formatAttachmentSummary(
@@ -239,7 +250,7 @@ async function runAsk(prompt: string, options: RunOptions = {}): Promise<void> {
   const spinner = new WaitingSpinner();
   spinner.start('waiting for response');
 
-  const { sessionId } = await submitPrompt({
+  const { sessionId } = await modelBackend.submit({
     mode: 'ask',
     prompt: userPrompt,
     systemPrompt,
@@ -290,10 +301,11 @@ async function runAgent(task: string, options: RunOptions = {}): Promise<void> {
     contextPaths.length > 0
       ? await loadContextAttachments(process.cwd(), contextPaths)
       : { files: [], directories: [] };
-  const context = formatAgentContextJson(
+  let context = formatAgentContextJson(
     attachment.files,
     projectSummary,
     attachment.directories,
+    { prompt: userTask },
   );
 
   if (attachment.files.length > 0 || attachment.directories.length > 0) {
@@ -314,6 +326,8 @@ async function runAgent(task: string, options: RunOptions = {}): Promise<void> {
   });
 
   const maxAttempts = 3;
+  let contextReads = 0;
+  let toolRounds = 0;
   let raw = '';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -328,7 +342,7 @@ async function runAgent(task: string, options: RunOptions = {}): Promise<void> {
     const spinner = new WaitingSpinner();
     spinner.start('waiting for agent response');
 
-    const { sessionId } = await submitPrompt({
+    const { sessionId } = await modelBackend.submit({
       mode: 'agent',
       prompt: userTask,
       systemPrompt,
@@ -384,11 +398,35 @@ async function runAgent(task: string, options: RunOptions = {}): Promise<void> {
     try {
       tracker.step('loading', 'validating AI response');
       const payload = parseAIResponse(raw, { conversationId });
+      if (payload.toolRequests) {
+        if (toolRounds + contextReads >= MAX_FILE_TOOL_ROUNDS) { writeWarning('Read-only tool limit reached. Narrow the task and continue.'); return; }
+        const result = await runFileTools(process.cwd(), context, payload.toolRequests, MAX_FILE_TOOL_ROUNDS - toolRounds - contextReads - 1);
+        context = result.context; toolRounds++;
+        for (const entry of result.results) writeInfo(`read-only ${entry.tool}: ${entry.path} (${entry.ok ? 'ok' : entry.error})`);
+        message = buildFullMessage('agent', systemPrompt, userTask, context);
+        attempt -= 1;
+        continue;
+      }
+      if (payload.contextRequests) {
+        if (contextReads >= 2 || contextReads + toolRounds >= MAX_FILE_TOOL_ROUNDS) {
+          writeWarning('Context read limit reached. Select the required files or narrow the task.');
+          return;
+        }
+        context = await expandAgentContext(process.cwd(), context, payload.contextRequests);
+        contextReads += 1;
+        writeInfo(`read requested context (${contextReads}/2); no files changed`);
+        message = buildFullMessage('agent', systemPrompt, userTask, context);
+        attempt -= 1;
+        continue;
+      }
       if (payload.error) {
-        throw new Error(payload.error);
+        tracker.complete('needs user input');
+        writeWarning(payload.error);
+        return;
       }
 
       const operations = payload.operations ?? [];
+      await assertContextEdits(operations, context, process.cwd());
       const hasMarkdownCreate = operations.some(
         (op) => op.action === 'CREATE_FILE' && /\.md$/i.test(op.path ?? ''),
       );
@@ -414,6 +452,12 @@ async function runAgent(task: string, options: RunOptions = {}): Promise<void> {
       await executeOperations(operations, process.cwd(), {
         conversationId: payload.conversationId,
         onStep: (step, detail) => tracker.step(step as TrackerStep, detail),
+        verify: async () => {
+          tracker.step('testing', 'temporary workspace copy');
+          const result = await runVerificationInSandbox(process.cwd());
+          writeInfo(result.summary);
+          return result;
+        },
       });
       writeSuccess(`applied ${operations.length} operation(s)`);
       tracker.complete(`applied ${operations.length} operation(s)`);

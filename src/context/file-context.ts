@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import fg from 'fast-glob';
 import fs from 'fs-extra';
 import { collectProjectDirectories, scanDirectoryTree, type ContextDirectory } from './directory-tree.js';
@@ -11,6 +12,18 @@ export const CONTEXT_IGNORE = [
   '**/coverage/**',
   '**/.next/**',
   '**/.turbo/**',
+  '**/.pnpm-store/**',
+  '**/.cache/**',
+  '**/.venv/**',
+  '**/.aws/**',
+  '**/.ssh/**',
+  '**/.azure/**',
+  '**/.kube/**',
+  '**/__pycache__/**',
+  '**/build/**',
+  '**/*.tsbuildinfo',
+  '**/.env*',
+  '**/*.{pem,key,p12,pfx}',
 ];
 
 /** Binary assets are listed in folder trees but never embedded as text context. */
@@ -274,6 +287,7 @@ export function formatAgentContextJson(
   files: ContextFile[],
   projectSummary?: string,
   directories: ContextDirectory[] = [],
+  options: { prompt?: string } = {},
 ): string {
   const payload = {
     projectSummary: projectSummary ?? null,
@@ -281,24 +295,7 @@ export function formatAgentContextJson(
       platform: process.platform,
       shell: process.platform === 'win32' ? process.env.COMSPEC ?? 'cmd.exe' : '/bin/sh',
     },
-    editingRules: [
-      'Context files below include line numbers (format: "   1| code").',
-      'contextDirectories lists attached folder trees, including empty folders with no files.',
-      'Binary image/media files (png, jpg, gif, webp, etc.) may appear in folder trees but are not embedded in context.',
-      'If contextDirectories.empty is true, the folder exists but has no files — use CREATE_FILE, not EDIT_FILE.',
-      'For EDIT_FILE on an existing file: prefer startLine, endLine, and replace for partial edits.',
-      'For code files (.js, .json, .yml, etc.): use ---OB_FILE_BEGIN: path--- ... ---OB_FILE_END--- blocks.',
-      'For README.md and .md files: use ONE ```markdown ... ``` fenced block (ask mode = draft only, agent mode = create file).',
-      'Do NOT create README.md or other .md files unless the user explicitly asks for them.',
-      'For YAML (.yml/.yaml): use OB_FILE blocks with real line breaks — not ```yaml fences.',
-      'For directories: use CREATE_FOLDER — NOT RUN_COMMAND mkdir/md/New-Item.',
-      'Operation order: CREATE_FOLDER first, then CREATE_FILE/EDIT_FILE, then RUN_COMMAND last.',
-      'pnpm-workspace.yaml must use list dashes: packages: then "  - \\"apps/*\\"" on each line.',
-      'Create package.json files via CREATE_FILE before pnpm install — not pnpm init in shell.',
-      'For RUN_COMMAND: put commands only in JSON { "action": "RUN_COMMAND", "command": "..." } — never only in ```bash blocks.',
-      'On Windows (runtime.platform win32): use forward slashes in command paths; avoid bash-only mkdir syntax.',
-      'Do not use EDIT_FILE on package.json after npm init — use CREATE_FILE with full package.json content instead.',
-    ],
+    contentFormat: '1-based numbered text: lineNumber| source. includedRanges are visible lines; partial/truncated files must not be fully replaced. Request more context if needed.',
     contextDirectories: directories.map((directory) => ({
       path: directory.relativePath,
       empty: directory.empty,
@@ -307,23 +304,31 @@ export function formatAgentContextJson(
       files: directory.files,
       treeText: directory.treeText,
     })),
-    contextFiles: files.map((file) => ({
-      path: file.path,
-      language: file.language,
-      truncated: file.truncated,
-      exists: true,
-      numberedContent: addLineNumbers(file.content),
-    })),
+    contextFiles: files.map((file) => {
+      const lines = file.content.split('\n');
+      const scoped = files.length === 1 && !file.truncated && lines.length > 100 &&
+        !/全文|整个|整体|全部|所有|重写|重构|审查|分析|总结|full|entire|review|refactor|rewrite|summari[sz]|\ball\b/i.test(options.prompt ?? '');
+      const tail = scoped && /末尾|最后|结尾|底部|\b(?:end|bottom|append|last)\b/i.test(options.prompt ?? '');
+      const head = !tail && scoped && /开头|首行|顶部|\b(?:beginning|top|prepend|first)\b/i.test(options.prompt ?? '');
+      const start = tail ? Math.max(1, lines.length - 49) : 1;
+      const end = head ? Math.min(50, lines.length) : lines.length;
+      return makeContextView(file, start, end);
+    }),
   };
 
-  return JSON.stringify(payload, null, 2);
+  return JSON.stringify(payload);
 }
 
-function addLineNumbers(content: string): string {
-  return content
-    .split('\n')
-    .map((line, index) => `${String(index + 1).padStart(4, ' ')}| ${line}`)
-    .join('\n');
+export function makeContextView(file: ContextFile, start = 1, end = file.content.split('\n').length) {
+  const lines = file.content.split('\n');
+  return {
+    path: file.path, language: file.language, exists: true, truncated: file.truncated,
+    partial: file.truncated || start > 1 || end < lines.length,
+    totalLines: file.truncated ? null : lines.length,
+    sourceHash: file.truncated ? null : createHash('sha256').update(file.content).digest('hex'),
+    includedRanges: [{ startLine: start, endLine: end }],
+    numberedContent: lines.slice(start - 1, end).map((line, index) => `${String(start + index).padStart(4, ' ')}| ${line}`).join('\n'),
+  };
 }
 
 function detectLanguage(filePath: string): string {

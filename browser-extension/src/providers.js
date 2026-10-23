@@ -4,23 +4,31 @@ const OPENBROWSER_PROVIDERS = {
     hosts: ['chatgpt.com', 'chat.openai.com'],
     selectors: {
       input: [
-        '#prompt-textarea',
         'div.ProseMirror#prompt-textarea[contenteditable="true"]',
+        '#prompt-textarea',
         'div.ProseMirror[contenteditable="true"]',
       ],
       send: [
         '#composer-submit-button',
         'button[data-testid="send-button"]',
         'button[aria-label="Send prompt"]',
+        'button[aria-label="Send message"]',
+        // Current localized ChatGPT composer has no ID or data-testid.
+        'button[type="submit"][aria-label="发送"]',
+        'button[type="submit"][aria-label="發送"]',
       ],
       assistant: [
         '[data-message-author-role="assistant"]',
         'article[data-turn="assistant"]',
+        '[data-markdown-text-style="assistant-message"]',
       ],
       stop: [
         '[data-testid="stop-button"]',
         'button[aria-label="Stop streaming"]',
         'button[aria-label="Stop generating"]',
+        'button[aria-label="停止生成"]',
+        'button[aria-label="停止流式传输"]',
+        'button[aria-label="停止回覆"]',
       ],
       markdown: ['.markdown', '.markdown-new-styling', '.prose'],
       attachButton: [

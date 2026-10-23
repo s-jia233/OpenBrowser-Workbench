@@ -1,12 +1,16 @@
 import crypto from 'node:crypto';
+import { identifyAi } from '../shared/ai-identity.js';
+import { browserReceptionSchema } from '../shared/browser-reception.js';
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { z } from 'zod';
 import { generateContext } from '../context/index.js';
 import { writePromptFile, readPromptFile } from '../memory/index.js';
 import { executeOperations, planOperations } from '../operations/index.js';
 import { validateOperations } from '../protocol/index.js';
 import { logger } from '../shared/index.js';
+import { registerWorkbench } from '../workbench/routes.js';
 import {
   PROMPT_FILE_COMPOSER_NOTE,
   PROMPT_FILE_NAME,
@@ -25,6 +29,8 @@ import {
   removeSessionClient,
   sendSseEvent,
   startSessionHeartbeat,
+  isTrustedBridgeOrigin,
+  recordBrowserHeartbeat,
 } from './sse-hub.js';
 import {
   completeSession,
@@ -33,6 +39,7 @@ import {
   getSession,
   tryClaimSession,
   updateSessionPartial,
+  updateSessionReception,
 } from './session-store.js';
 
 const PORT = Number(process.env.PORT ?? 5000);
@@ -42,11 +49,11 @@ interface ServerOptions {
   host?: string;
 }
 
-export async function createBridgeServer(): Promise<FastifyInstance> {
+export async function createBridgeServer(options: { workspaceRoot?: string } = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
 
   await app.register(cors, {
-    origin: true,
+    origin: (origin, callback) => callback(null, isTrustedBridgeOrigin(origin)),
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
@@ -81,8 +88,17 @@ export async function createBridgeServer(): Promise<FastifyInstance> {
   });
 
   app.addHook('preHandler', async (request) => {
+    const sameOrigin = request.headers.origin === `http://${request.headers.host}`
+      && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(request.headers.host || '');
+    if (!sameOrigin && !isTrustedBridgeOrigin(request.headers.origin)) {
+      const error = new Error('Untrusted browser origin') as Error & { statusCode: number };
+      error.statusCode = 403;
+      throw error;
+    }
     authenticate(request);
   });
+
+  await registerWorkbench(app, options.workspaceRoot ?? process.cwd());
 
   app.get('/health', async () => ({ status: 'ok' }));
 
@@ -182,6 +198,7 @@ export async function createBridgeServer(): Promise<FastifyInstance> {
       response: session.response,
       partialText: session.partialText,
       error: session.error,
+      reception: session.reception,
     };
   });
 
@@ -224,6 +241,7 @@ export async function createBridgeServer(): Promise<FastifyInstance> {
   });
 
   app.get('/browser/events', async (request, reply) => {
+    const { clientId } = z.object({ clientId: z.string().min(8).max(128).optional() }).parse(request.query);
     reply.hijack();
     const raw = reply.raw;
     const origin = request.headers.origin;
@@ -233,21 +251,28 @@ export async function createBridgeServer(): Promise<FastifyInstance> {
       removeBrowserClient(closedClient);
     }, origin);
 
-    addBrowserClient(client);
+    addBrowserClient(client, clientId);
     const heartbeat = setInterval(() => {
       client.write(': heartbeat\n\n');
     }, 15_000);
 
-    request.raw.on('close', () => clearInterval(heartbeat));
+    // IncomingMessage.close means the GET request completed, not that this
+    // long-lived response closed. Cleanup is attached to reply.raw above.
+  });
+
+  app.post('/browser/heartbeat', async (request) => {
+    const { clientId, readyTabs, readyHosts, readyPages } = z.object({ clientId: z.string().min(8).max(128), readyTabs: z.number().int().min(0).max(100), readyHosts: z.array(z.string().max(253)).max(100).optional(), readyPages: z.array(z.object({ tabId: z.number().int().positive(), host: z.string().max(253) })).max(100).optional() }).parse(request.body);
+    recordBrowserHeartbeat(clientId, readyTabs, readyHosts, readyPages);
+    return { ok: true };
   });
 
   app.post('/browser/claim', async (request) => {
-    const body = request.body as { sessionId?: string };
+    const body = z.object({ sessionId: z.string().uuid(), providerHost: z.string().max(253).optional(), clientId: z.string().min(8).max(128).optional(), tabId: z.number().int().positive().optional() }).parse(request.body);
     if (!body.sessionId) {
       throw new Error('sessionId is required');
     }
 
-    const session = tryClaimSession(body.sessionId);
+    const session = tryClaimSession(body.sessionId, identifyAi(body.providerHost), body.clientId && body.tabId ? { clientId: body.clientId, tabId: body.tabId } : undefined);
     if (!session) {
       return { claimed: false };
     }
@@ -284,49 +309,49 @@ export async function createBridgeServer(): Promise<FastifyInstance> {
   });
 
   app.post('/browser/chunk', async (request) => {
-    const body = request.body as {
-      sessionId?: string;
-      text?: string;
-    };
-
-    if (!body.sessionId || body.text === undefined) {
-      throw new Error('sessionId and text are required');
-    }
+    const parsed = z.object({ sessionId: z.string().uuid(), text: z.string().max(700_000).optional(),
+      reception: browserReceptionSchema.optional(), clientId: z.string().max(128).optional(),
+      tabId: z.number().int().positive().optional(), providerHost: z.string().max(253).optional(),
+    }).refine((body) => body.text !== undefined || body.reception !== undefined).safeParse(request.body);
+    if (!parsed.success) throw Object.assign(new Error('Invalid chunk or reception metadata'), { statusCode: 400 });
+    const body = parsed.data;
 
     const session = getSession(body.sessionId);
     if (!session) {
       throw new Error('Session not found');
     }
+    requireBrowserSource(body.sessionId, body);
 
-    updateSessionPartial(body.sessionId, body.text);
-    notifySessionChunk(body.sessionId, { text: body.text });
-    return { accepted: true };
+    let accepted = false;
+    if (body.reception) accepted = updateSessionReception(body.sessionId, body.reception);
+    if (body.text !== undefined && updateSessionPartial(body.sessionId, body.text)) {
+      notifySessionChunk(body.sessionId, { text: body.text }); accepted = true;
+    }
+    return { accepted };
   });
 
   app.post('/browser/response', async (request) => {
-    const body = request.body as {
-      sessionId?: string;
-      text?: string;
-      error?: string;
-    };
-
-    if (!body.sessionId) {
-      throw new Error('sessionId is required');
-    }
+    const parsed = z.object({
+      sessionId: z.string().uuid(),
+      text: z.string().min(1).max(700_000).optional(),
+      error: z.string().min(1).max(700_000).optional(),
+      clientId: z.string().min(8).max(128).optional(),
+      tabId: z.number().int().positive().optional(),
+    }).refine((body) => (body.text !== undefined) !== (body.error !== undefined)).safeParse(request.body);
+    if (!parsed.success) throw Object.assign(new Error('Provide either reply text or an error string'), { statusCode: 400 });
+    const body = parsed.data;
+    const session = requireBrowserSource(body.sessionId, body);
 
     if (body.error) {
-      failSession(body.sessionId, body.error);
+      if (!failSession(body.sessionId, body.error)) return { accepted: false, status: session.status };
       notifySessionError(body.sessionId, { error: body.error });
       logger.warn({ sessionId: body.sessionId, error: body.error }, 'Browser session failed');
       return { accepted: true, status: 'error' };
     }
 
-    if (!body.text) {
-      throw new Error('text or error is required');
-    }
-
-    completeSession(body.sessionId, body.text);
-    notifySessionComplete(body.sessionId, { response: body.text });
+    const text = body.text!;
+    if (!completeSession(body.sessionId, text)) return { accepted: false, status: session.status };
+    notifySessionComplete(body.sessionId, { response: text });
     logger.info({ sessionId: body.sessionId }, 'Browser response received');
 
     return { accepted: true, status: 'complete' };
@@ -352,6 +377,18 @@ export async function startServer(options: ServerOptions = {}): Promise<FastifyI
   return app;
 }
 
+function requireBrowserSource(sessionId: string, source: { clientId?: string; tabId?: number }) {
+  const session = getSession(sessionId);
+  if (!session) throw Object.assign(new Error('Session not found'), { statusCode: 404 });
+  // Untargeted jobs still belong to the tab that won the atomic claim.
+  // Legacy clients without claim metadata retain their existing behavior.
+  const expected = session.target ?? session.claimedBy;
+  if (expected && (expected.clientId !== source.clientId || expected.tabId !== source.tabId)) {
+    throw Object.assign(new Error('回复不是来自指定标签页'), { statusCode: 403 });
+  }
+  return session;
+}
+
 function authenticate(request: FastifyRequest): void {
   if (request.method === 'OPTIONS') {
     return;
@@ -360,6 +397,8 @@ function authenticate(request: FastifyRequest): void {
   const url = request.url.split('?')[0] ?? request.url;
 
   if (
+    url === '/' || url === '/workbench.css' || url === '/workbench.js' || url === '/ai-status.js' || url === '/composer-controls.js' || url === '/conversation-menu.js' || url === '/collaboration.js' || url === '/collaboration-report.js' || url === '/collaboration-drafts.js' || url === '/execution-status.js' || url === '/browser-targets.js' || url === '/task-drafts.js' || url === '/favicon.svg' ||
+    url.startsWith('/api/ui/') ||
     url === '/health' ||
     url.startsWith('/browser/') ||
     /^\/session\/[^/]+\/(status|events)$/.test(url)
